@@ -1,0 +1,47 @@
+{
+  "name": "@local/mission-control",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Mission console for Agent Teams: per-mission teammate cap, token sentinel with automatic handoff, instant relay of console messages, and a real-time progress dashboard.",
+  "license": "MIT",
+  "author": "Psychologist-jpg",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "agent-teams",
+    "mission-control",
+    "dashboard"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Psychologist-jpg/mission-control.git"
+  },
+  "homepage": "https://github.com/Psychologist-jpg/mission-control#readme",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./dashboard.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "dashboard.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-layout"
+      ]
+    }
+  }
+}

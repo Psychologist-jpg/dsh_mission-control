@@ -1,0 +1,9 @@
+- insert:
+    - id: mission-control
+      name: '@local/mission-control'
+      config:
+        pollIntervalMs: 15000
+        warnRatio: 0.65
+        handoffRatio: 0.85
+        defaultCap: 3
+        freshProvider: spawn

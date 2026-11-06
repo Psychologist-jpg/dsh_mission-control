@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Mission Control",
+    "description": "Task control for Agent Teams: per-mission teammate cap, context-pressure sentinel with automatic handoff, and instant broadcast of console messages to the whole team."
+  }
+}
