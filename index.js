@@ -290,6 +290,18 @@ export function apply(ctx, rawConfig) {
     for (const mission of missions.values()) {
       const tasks = missionTasks(mission)
       const count = (status) => tasks.filter((t) => t.status === status).length
+      // 主会话名称：标题服务优先，退回会话 id 尾号
+      let title = ''
+      try {
+        const titleService = ctx.get('sessionTitle')
+        const session = services.sessions()?.get(mission.sessionId)
+        if (titleService && session && typeof titleService.get === 'function') {
+          title = titleService.get(session)?.title ?? ''
+        }
+      } catch {
+        // 标题服务不可用时退回 id
+      }
+      if (!title) title = `会话 ${String(mission.sessionId).slice(-6)}`
       const teammates = missionMembers(mission).map((member) => {
         const usage = measureMember(member)
         return {
@@ -303,6 +315,7 @@ export function apply(ctx, rawConfig) {
       })
       out.missions.push({
         sessionId: mission.sessionId,
+        title,
         task: mission.task,
         cap: mission.cap,
         paused: mission.paused === true,

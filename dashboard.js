@@ -91,10 +91,13 @@ window.__ModuleLoader__.load({
 
     const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 
-    function readPosition() {
+    function readPosition(key, index = 0) {
       try {
-        const raw = window.localStorage.getItem(POS_KEY);
-        if (!raw) return null;
+        const raw = window.localStorage.getItem(`${POS_KEY}:${key}`);
+        if (!raw) {
+          // 多窗口时默认错开，避免完全重叠
+          return { x: window.innerWidth - 360 - MARGIN, y: 120 + index * 28 };
+        }
         const p = JSON.parse(raw);
         return p && typeof p.x === 'number' && typeof p.y === 'number' ? { x: p.x, y: p.y } : null;
       } catch {
@@ -102,9 +105,9 @@ window.__ModuleLoader__.load({
       }
     }
 
-    function readOpen() {
+    function readOpen(key) {
       try {
-        const raw = window.localStorage.getItem(OPEN_KEY);
+        const raw = window.localStorage.getItem(`${OPEN_KEY}:${key}`);
         return raw === '0' ? false : true;
       } catch {
         return true;
@@ -547,18 +550,17 @@ window.__ModuleLoader__.load({
     }
 
     /** 悬浮窗：固定在页面上方，可拖动、可折叠，位置与折叠状态写入 localStorage。 */
-    function FloatingWindow() {
-      const snap = useDashboard();
-      const [open, setOpen] = React.useState(readOpen);
-      const [pos, setPos] = React.useState(readPosition);
+    function MissionWindow({ mission, index, onEnded }) {
+      const storeKey = mission.sessionId || 'default';
+      const [open, setOpen] = React.useState(() => readOpen(storeKey));
+      const [pos, setPos] = React.useState(() => readPosition(storeKey, index));
       const [dragging, setDragging] = React.useState(false);
       const [stopping, setStopping] = React.useState(false);
-      const [ended, setEnded] = React.useState(null);
 
       const rootRef = React.useRef(null);
       const dragRef = React.useRef(null);
 
-      const missions = (snap && snap.active && snap.missions) || [];
+      const missions = [mission];
 
       const hasPos = pos !== null;
       React.useEffect(() => {
@@ -578,28 +580,7 @@ window.__ModuleLoader__.load({
         return () => window.removeEventListener('resize', onResize);
       }, [hasPos]);
 
-      if (missions.length === 0) {
-        if (!ended) return null;
-        const endedStyle = s.window(false, false);
-        if (pos) {
-          endedStyle.left = pos.x;
-          endedStyle.top = pos.y;
-          endedStyle.right = 'auto';
-          endedStyle.bottom = 'auto';
-        }
-        return h('div', {
-          ref: rootRef,
-          style: endedStyle,
-          role: 'status',
-          'aria-label': '项目已结束',
-        },
-          h('div', { style: s.head },
-            h('span', { style: s.dot(T.success) }),
-            h('span', { style: s.title }, '项目已结束'),
-            h('span', { style: s.meta }, ended.summary || ''),
-          ),
-        );
-      }
+      if (!mission) return null;
 
       let mateCount = 0;
       let runningCount = 0;
@@ -619,7 +600,7 @@ window.__ModuleLoader__.load({
       const toggle = () => {
         setOpen((v) => {
           const next = !v;
-          store(OPEN_KEY, next ? '1' : '0');
+          store(`${OPEN_KEY}:${storeKey}`, next ? '1' : '0');
           return next;
         });
       };
@@ -672,7 +653,7 @@ window.__ModuleLoader__.load({
         if (!d) return;
         if (d.moved) {
           setPos((p) => {
-            if (p) store(POS_KEY, JSON.stringify(p));
+            if (p) store(`${POS_KEY}:${storeKey}`, JSON.stringify(p));
             return p;
           });
         } else {
@@ -709,9 +690,13 @@ window.__ModuleLoader__.load({
           const deleted = (result.cleanup && result.cleanup.deleted) || [];
           const interrupted = result.interrupted || [];
           const files = result.resultFiles || [];
-          setEnded({
-            summary: `已停止 ${interrupted.length} 个子会话 · 清理 ${deleted.length} 个临时文件 · 保留 ${files.length} 个结果文件${result.leadNotified ? ' · 已请求主会话汇总' : ''}`,
-          });
+          if (typeof onEnded === 'function') {
+            onEnded({
+              sessionId: mission.sessionId,
+              title: mission.title || '蜂巢任务',
+              summary: `已停止 ${interrupted.length} 个子会话 · 清理 ${deleted.length} 个临时文件 · 保留 ${files.length} 个结果文件${result.leadNotified ? ' · 已请求主会话汇总' : ''}`,
+            })
+          }
         } catch {
           // 网络失败时保持面板不动，轮询会显示真实状态
         } finally {
@@ -735,7 +720,8 @@ window.__ModuleLoader__.load({
         },
       },
         h('span', { style: s.dot(runningCount > 0 ? T.brand : T.success) }),
-        h('span', { style: s.title }, '蜂巢任务'),
+        h('span', { style: { ...s.title, maxWidth: 150, overflow: 'hidden', textOverflow: 'ellipsis' }, title: mission.title || '' },
+          mission.title || '蜂巢任务'),
         h('span', { style: s.meta }, `${mateCount} 工蜂${runningCount ? ` · ${runningCount} 工作中` : ' · 全部空闲'}${paused ? ' · 已暂停' : ''}`),
         open ? h('span', { style: s.bar }, h('span', { style: s.barFill(pct, T.success) })) : null,
         open ? h('span', { style: s.meta }, `${pct}%`) : null,
@@ -776,6 +762,117 @@ window.__ModuleLoader__.load({
       );
     }
 
+    /** 结束提示小卡片：可拖动、可关闭，15 秒后自动消失。 */
+    function EndedCard({ info, index, onClose }) {
+      const storeKey = `ended:${info.sessionId || 'default'}`;
+      const [pos, setPos] = React.useState(() => readPosition(storeKey, index));
+      const [dragging, setDragging] = React.useState(false);
+      const rootRef = React.useRef(null);
+      const dragRef = React.useRef(null);
+
+      const onPointerDown = (e) => {
+        if (e.pointerType === 'mouse' && e.button !== 0) return;
+        const el = rootRef.current;
+        if (!el) return;
+        const rect = el.getBoundingClientRect();
+        dragRef.current = { id: e.pointerId, dx: e.clientX - rect.left, dy: e.clientY - rect.top };
+        if (e.currentTarget.setPointerCapture) e.currentTarget.setPointerCapture(e.pointerId);
+      };
+      const onPointerMove = (e) => {
+        const d = dragRef.current;
+        if (!d || d.id !== e.pointerId) return;
+        setDragging(true);
+        const el = rootRef.current;
+        const w = el ? el.offsetWidth : 300;
+        setPos({
+          x: clamp(e.clientX - d.dx, MARGIN, Math.max(MARGIN, window.innerWidth - w - MARGIN)),
+          y: clamp(e.clientY - d.dy, MARGIN, Math.max(MARGIN, window.innerHeight - 40)),
+        });
+      };
+      const onPointerUp = (e) => {
+        const d = dragRef.current;
+        if (!d || d.id !== e.pointerId) return;
+        dragRef.current = null;
+        try { e.currentTarget.releasePointerCapture(e.pointerId); } catch { /* 已释放 */ }
+        setDragging(false);
+        setPos((p) => {
+          if (p) store(`${POS_KEY}:${storeKey}`, JSON.stringify(p));
+          return p;
+        });
+      };
+
+      const cardStyle = s.window(true, dragging);
+      if (pos) {
+        cardStyle.left = pos.x;
+        cardStyle.top = pos.y;
+        cardStyle.right = 'auto';
+        cardStyle.bottom = 'auto';
+      }
+      cardStyle.maxWidth = 360;
+
+      return h('div', {
+        ref: rootRef,
+        style: cardStyle,
+        role: 'status',
+        'aria-label': '项目已结束',
+      },
+        h('div', {
+          style: { ...s.head, cursor: dragging ? 'grabbing' : 'grab' },
+          onPointerDown, onPointerMove, onPointerUp,
+          title: '拖动可移动',
+        },
+          h('span', { style: s.dot(T.success) }),
+          h('span', { style: { ...s.title, maxWidth: 120, overflow: 'hidden', textOverflow: 'ellipsis' } }, info.title || '项目已结束'),
+          h('span', { style: { ...s.meta, flex: '1 1 auto', whiteSpace: 'normal' } }, info.summary || ''),
+          h('button', {
+            type: 'button',
+            title: '关闭',
+            'aria-label': '关闭结束提示',
+            onClick: onClose,
+            onPointerDown: (e) => e.stopPropagation(),
+            onPointerMove: (e) => e.stopPropagation(),
+            onPointerUp: (e) => e.stopPropagation(),
+            style: {
+              flex: 'none', border: 0, background: 'transparent', color: T.secondary,
+              fontFamily: 'inherit', fontSize: 14, lineHeight: 1, padding: '2px 4px',
+              cursor: 'pointer', borderRadius: 6,
+            },
+          }, '×'),
+        ),
+      );
+    }
+
+    /** 全局入口：为每个主会话渲染独立悬浮窗。 */
+    function Dashboard() {
+      const snap = useDashboard();
+      const [ended, setEnded] = React.useState(null);
+
+      React.useEffect(() => {
+        if (!ended) return undefined;
+        const timer = setTimeout(() => setEnded(null), 15000);
+        return () => clearTimeout(timer);
+      }, [ended]);
+
+      const missions = (snap && snap.active && snap.missions) || [];
+      const onEnded = (info) => setEnded(info);
+
+      if (missions.length === 0 && !ended) return null;
+      return h(React.Fragment, null,
+        ...missions.map((m, i) => h(MissionWindow, {
+          key: m.sessionId || i,
+          mission: m,
+          index: i,
+          onEnded,
+        })),
+        ended ? h(EndedCard, {
+          key: `ended-${ended.sessionId || 'x'}`,
+          info: ended,
+          index: missions.length,
+          onClose: () => setEnded(null),
+        }) : null,
+      );
+    }
+
     return {
       inject: ['slots', 'locale'],
       apply(ctx) {
@@ -785,12 +882,12 @@ window.__ModuleLoader__.load({
           id: 'mission-hive-toggle',
           order: -25,
         }, HiveToggle));
-        // 全局悬浮层：蜂巢任务监控面板
+        // 全局悬浮层：每个主会话一个监控悬浮窗
         ctx.slots.inject('shell.overlay', () => ctx.slots.register({
           name: 'shell.overlay',
           id: 'mission-dashboard',
           order: -30,
-        }, FloatingWindow));
+        }, Dashboard));
       },
     };
   },
