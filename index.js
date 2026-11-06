@@ -11,6 +11,7 @@
  */
 
 import { readdir, unlink, rm } from 'node:fs/promises'
+import { existsSync, statSync, readdirSync } from 'node:fs'
 import { join, resolve, sep } from 'node:path'
 
 const DEFAULT_CONFIG = {
@@ -37,6 +38,8 @@ const DEFAULT_CONFIG = {
   // 「结束任务」要整个删除的临时目录（相对工作目录）
   cleanupDirs: ['.mission-control/tmp'],
   cleanupMaxFiles: 500,
+  // 结束时是否物理删除子会话的日志文件（默认关闭：仅归档，不删记录）
+  deleteSessionLogs: false,
 }
 
 /** 把一个 glob（仅支持 * 和 ?）编译成正则。 */
@@ -302,6 +305,7 @@ export function apply(ctx, rawConfig) {
         sessionId: mission.sessionId,
         task: mission.task,
         cap: mission.cap,
+        paused: mission.paused === true,
         startedAt: mission.startedAt,
         teammates,
         board: {
@@ -380,6 +384,8 @@ export function apply(ctx, rawConfig) {
   }
 
   function broadcast(mission, text) {
+    // 暂停：子会话继续工作，但主会话的话不再下发给子会话
+    if (mission.paused) return 0
     const agent = services.agents()?.get(mission.sessionId)
     const team = services.team()
     if (!agent || !team) return 0
@@ -448,16 +454,26 @@ export function apply(ctx, rawConfig) {
     execute(args, exec) {
       const agent = exec.agent
       if (!agent) throw new Error('mission_start requires an owning agent session')
-      missions.set(String(agent.id), {
-        sessionId: String(agent.id),
-        task: String(args.task),
-        cap: Number(args.workers),
-        startedAt: Date.now(),
-        baseline: new Set(teammatesOf(agent).map((m) => m.name)),
-        baselineTasks: new Set(tasksOf(agent).map((t) => t.id)),
-        handoffInFlight: new Set(),
-        handoffRounds: new Map(),
-      })
+      const key = String(agent.id)
+      const existing = missions.get(key)
+      if (existing) {
+        // 重复声明 = 更新任务与上限；保留基线、暂停态与交接记录
+        existing.task = String(args.task)
+        existing.cap = Number(args.workers)
+        existing.paused = false
+      } else {
+        missions.set(key, {
+          sessionId: key,
+          task: String(args.task),
+          cap: Number(args.workers),
+          startedAt: Date.now(),
+          paused: false,
+          baseline: new Set(teammatesOf(agent).map((m) => m.name)),
+          baselineTasks: new Set(tasksOf(agent).map((t) => t.id)),
+          handoffInFlight: new Set(),
+          handoffRounds: new Map(),
+        })
+      }
       return Promise.resolve({
         ok: true,
         workers: Number(args.workers),
@@ -716,6 +732,52 @@ export function apply(ctx, rawConfig) {
     })
   }
 
+  /**
+   * 开关蜂巢模式：开启=进入蜂巢模式（必要时建任务），关闭=暂停。
+   * 暂停时子会话继续工作，但主会话消息不再下发给子会话。
+   */
+  function setMissionMode(sessionId, options = {}) {
+    if (!sessionId) return { ok: false, error: 'missing-session' }
+    const enabled = options.enabled !== false
+    const workers = Number.isFinite(Number(options.workers))
+      ? Math.min(10, Math.max(2, Math.floor(Number(options.workers))))
+      : undefined
+    const existing = missions.get(sessionId)
+
+    if (enabled) {
+      if (existing) {
+        existing.paused = false
+        if (workers !== undefined) existing.cap = workers
+      } else {
+        const agent = services.agents()?.get(sessionId)
+        missions.set(sessionId, {
+          sessionId,
+          task: '（等待任务：主会话中说明目标后由 Lead 分配）',
+          cap: workers ?? (Number(config.defaultCap) || 3),
+          startedAt: Date.now(),
+          paused: false,
+          baseline: new Set(agent ? teammatesOf(agent).map((m) => m.name) : []),
+          baselineTasks: new Set(agent ? tasksOf(agent).map((t) => t.id) : []),
+          handoffInFlight: new Set(),
+          handoffRounds: new Map(),
+        })
+      }
+    } else if (existing) {
+      existing.paused = true
+      if (workers !== undefined) existing.cap = workers
+    }
+
+    const mission = missions.get(sessionId)
+    return {
+      ok: true,
+      sessionId,
+      enabled: mission ? mission.paused !== true : false,
+      paused: mission ? mission.paused === true : false,
+      cap: mission ? mission.cap : (workers ?? (Number(config.defaultCap) || 3)),
+      active: Boolean(mission),
+    }
+  }
+
   // ── 结束任务：停掉所有子会话 + 保留结果 + 删除临时文件 ──────────────────
   /** 工作目录：优先取该任务 Lead 会话的目录，退回默认工作目录。 */
   function workspaceOf(agent) {
@@ -795,17 +857,366 @@ export function apply(ctx, rawConfig) {
     return { root: base, deleted, errors }
   }
 
-  /** 结束任务：中断该会话下所有子智能体、清除任务状态、清理临时文件。 */
+  /** 从任意 JSON 结构里递归取出疑似文件路径的字符串。 */
+  function collectPathValues(value, sink, depth = 0) {
+    if (depth > 4 || value == null) return
+    if (typeof value === 'string') {
+      sink.push(value)
+      return
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) collectPathValues(item, sink, depth + 1)
+      return
+    }
+    if (typeof value === 'object') {
+      for (const [key, inner] of Object.entries(value)) {
+        if (typeof inner === 'string') {
+          if (/path|file|target|output|dest|name/i.test(key)) sink.push(inner)
+          else if (/command|script|cmd/i.test(key)) sink.push(inner)
+        } else {
+          collectPathValues(inner, sink, depth + 1)
+        }
+      }
+    }
+  }
+
+  /** 从一段自由文本里挖出看起来像文件路径的片段。 */
+  function extractPathsFromText(text) {
+    const found = []
+    // Windows 绝对路径
+    for (const match of String(text).matchAll(/[A-Za-z]:\\[^\s"'<>|*?\r\n]+/g)) found.push(match[0])
+    // 带常见扩展名的引号内相对路径
+    for (const match of String(text).matchAll(/["']([^"'\r\n]+\.(?:md|markdown|txt|json|jsonl|js|mjs|cjs|ts|tsx|jsx|py|log|csv|tsv|xlsx|docx|pptx|pdf|png|jpe?g|svg|html|css|ya?ml))["']/gi)) {
+      found.push(match[1])
+    }
+    return found
+  }
+
+  /** 扫描工作目录中在任务开始后修改过的文件（兜底识别产出）。 */
+  function scanRecentFiles(root, sinceMs, deletedSet) {
+    const out = []
+    const base = resolve(root || process.cwd())
+    const skipDirs = new Set(['node_modules', '.git', '.mission-control'])
+    let visited = 0
+    const walk = (dir, depth) => {
+      if (depth > 4 || out.length > 200 || visited > 5000) return
+      let entries
+      try {
+        entries = readdirSync(dir, { withFileTypes: true })
+      } catch {
+        return
+      }
+      for (const entry of entries) {
+        if (visited > 5000 || out.length > 200) return
+        const full = join(dir, entry.name)
+        if (entry.isDirectory()) {
+          if (skipDirs.has(entry.name)) continue
+          visited += 1
+          walk(full, depth + 1)
+          continue
+        }
+        if (!entry.isFile()) continue
+        visited += 1
+        const abs = resolve(full)
+        if (deletedSet.has(abs)) continue
+        try {
+          const info = statSync(abs)
+          if (info.mtimeMs >= sinceMs) out.push(abs)
+        } catch {
+          // 读不到就跳过
+        }
+      }
+    }
+    walk(base, 0)
+    return out
+  }
+
+  /** 收集本次任务产出的结果文件（本任务成员写过、仍在磁盘上、未被清理掉）。 */
+  function collectResultFiles(members, deletedSet, root) {
+    const seen = new Set()
+    const out = []
+    const base = resolve(root || process.cwd())
+    const candidate = (raw) => {
+      if (typeof raw !== 'string') return
+      const trimmed = raw.trim().replace(/^["']|["']$/g, '')
+      if (!trimmed || trimmed.length > 400) return
+      if (!/\.[A-Za-z0-9]{1,8}$/.test(trimmed)) return
+      const abs = resolve(/^[A-Za-z]:\\/.test(trimmed) || trimmed.startsWith('/') ? trimmed : join(base, trimmed))
+      if (abs.includes(`${sep}node_modules${sep}`) || abs.includes(`${sep}.git${sep}`)) return
+      if (seen.has(abs)) return
+      seen.add(abs)
+      if (deletedSet.has(abs)) return
+      try {
+        if (!existsSync(abs)) return
+        if (!statSync(abs).isFile()) return
+      } catch {
+        return
+      }
+      out.push(abs)
+    }
+
+    for (const member of members ?? []) {
+      const session = services.sessions()?.get(String(member.id))
+      if (!session) continue
+      let events
+      try {
+        events = session.snapshotEvents()
+      } catch {
+        continue
+      }
+      for (const event of events) {
+        if (event.type !== 'tool/call') continue
+        const rawArgs = event.data?.arguments
+        let parsed
+        try {
+          parsed = JSON.parse(rawArgs ?? '{}')
+        } catch {
+          parsed = undefined
+        }
+        if (parsed && typeof parsed === 'object') {
+          const sink = []
+          collectPathValues(parsed, sink)
+          for (const value of sink) {
+            candidate(value)
+            for (const extra of extractPathsFromText(value)) candidate(extra)
+          }
+        } else if (typeof rawArgs === 'string') {
+          for (const extra of extractPathsFromText(rawArgs)) candidate(extra)
+        }
+      }
+    }
+    return out
+  }
+
+  /** 让主会话（Lead）输出最终结果汇总：投递一条 prompt 并唤醒它。 */
+  async function askLeadToSummarize(mission, payload) {
+    const controller = ctx.get('sessionController')
+    if (!controller || typeof controller.prompt !== 'function') return false
+    const { task, interrupted, deleted, resultFiles, boardDone, reports, closed = [] } = payload
+    const lines = [
+      '【蜂巢任务已结束】',
+      '',
+      `任务目标：${task || '（未记录）'}`,
+      `已停止子会话：${interrupted.length} 个${interrupted.length ? `（${interrupted.join('、')}）` : ''}`,
+      `已关闭（归档）子会话：${closed.length} 个`,
+      `已清理临时文件：${deleted.length} 个`,
+      '',
+    ]
+    if (resultFiles.length > 0) {
+      lines.push('## 结果文件（全部保留）')
+      for (const file of resultFiles) lines.push(`- ${file}`)
+      lines.push('')
+    } else {
+      lines.push('## 结果文件', '（本次任务没有检测到落盘的结果文件）', '')
+    }
+    if (boardDone.length > 0) {
+      lines.push('## 任务板已完成事项')
+      for (const item of boardDone) lines.push(`- ${item}`)
+      lines.push('')
+    }
+    if (reports.length > 0) {
+      lines.push('## 各成员汇报')
+      for (const r of reports) lines.push(`- ${r.name}：${r.summary}`)
+      lines.push('')
+    }
+    lines.push(
+      '请现在向用户输出本次项目的最终结果汇总：',
+      '1. 用简短中文说明这次任务完成了什么；',
+      '2. **必须逐个列出上面所有结果文件的完整路径**，并各用一句话说明其用途；',
+      '3. 如果结果文件确实存在，请调用 `present` 工具把它们作为交付物展示给用户；',
+      '4. 不要重新开工蜂，不要继续任务，只做汇总。',
+    )
+    const text = lines.join('\n')
+    const request = {
+      requestId: `mission-end-${Date.now()}`,
+      sessionId: mission.sessionId,
+      mode: 'queue',
+      content: [{ type: 'text', text }],
+    }
+    try {
+      await controller.prompt(request, new AbortController().signal)
+      return true
+    } catch {
+      // 回落：直接投递到该 Agent 的收件箱
+      try {
+        const agent = services.agents()?.get(mission.sessionId)
+        if (agent && typeof agent.inject === 'function') {
+          agent.inject({ content: [{ type: 'text', text }] })
+          return true
+        }
+      } catch {
+        // 无法唤醒主会话：结果仍在 HTTP 响应里
+      }
+      return false
+    }
+  }
+
+  /** 关闭（归档）子会话；可选删除其日志文件。 */
+  async function closeChildSessions(members) {
+    const registry = ctx.get('workspaceRegistry')
+    const archived = []
+    const failures = []
+    for (const member of members ?? []) {
+      try {
+        if (registry && typeof registry.archiveSession === 'function') {
+          await registry.archiveSession(member.id, { stopActivity: true })
+        }
+        archived.push(member.name)
+      } catch (error) {
+        failures.push(`${member.name}: ${errText(error)}`)
+      }
+    }
+
+    let removedLogs = 0
+    if (config.deleteSessionLogs === true) {
+      const home = process.env.DSH_HOME || join(process.env.USERPROFILE || '', '.dsh')
+      const dir = join(home, 'sessions')
+      const ids = new Set((members ?? []).map((m) => String(m.id)))
+      const walk = async (current, depth) => {
+        if (depth > 3) return
+        let entries
+        try {
+          entries = await readdir(current, { withFileTypes: true })
+        } catch {
+          return
+        }
+        for (const entry of entries) {
+          const full = join(current, entry.name)
+          if (entry.isDirectory()) {
+            await walk(full, depth + 1)
+            continue
+          }
+          const stem = entry.name.replace(/\.jsonl?$/i, '')
+          if (!ids.has(stem)) continue
+          try {
+            await unlink(full)
+            removedLogs += 1
+          } catch {
+            // 删不掉就保留
+          }
+        }
+      }
+      await walk(dir, 0)
+    }
+
+    return { archived, failures, removedLogs }
+  }
+
+  /** 列出某会话下的所有子会话（工蜂），供界面勾选删除。 */
+  function listChildSessions(sessionId) {
+    const agent = sessionId ? services.agents()?.get(String(sessionId)) : undefined
+    if (!agent) return { ok: false, error: 'session-not-found', children: [] }
+    const registry = ctx.get('workspaceRegistry')
+    const children = teammatesOf(agent).map((member) => {
+      let archived = false
+      try {
+        archived = false
+      } catch {
+        // 忽略
+      }
+      return {
+        id: String(member.id),
+        name: member.name,
+        status: member.status,
+        description: member.description ?? '',
+        archived,
+      }
+    })
+    void registry
+    return { ok: true, children }
+  }
+
+  /** 删除指定的子会话：停止 → 归档 →（可选）删除日志文件。 */
+  async function deleteChildSessions(sessionId, childIds, options = {}) {
+    const agent = sessionId ? services.agents()?.get(String(sessionId)) : undefined
+    if (!agent) return { ok: false, error: 'session-not-found', deleted: [], errors: [] }
+    const team = services.team()
+    const registry = ctx.get('workspaceRegistry')
+    const wanted = new Set((childIds ?? []).map(String))
+    const targets = teammatesOf(agent).filter((m) => wanted.has(String(m.id)))
+
+    const deleted = []
+    const errors = []
+    for (const member of targets) {
+      try {
+        if (team && (member.status === 'running' || member.status === 'provisioning')) {
+          try {
+            team.interrupt(agent, member.name)
+          } catch {
+            // 已结束
+          }
+        }
+        if (registry && typeof registry.archiveSession === 'function') {
+          await registry.archiveSession(member.id, { stopActivity: true })
+        }
+        deleted.push({ id: String(member.id), name: member.name })
+      } catch (error) {
+        errors.push(`${member.name}: ${errText(error)}`)
+      }
+    }
+
+    let removedLogs = 0
+    if (options.deleteLogs === true && deleted.length > 0) {
+      const home = process.env.DSH_HOME || join(process.env.USERPROFILE || '', '.dsh')
+      const dir = join(home, 'sessions')
+      const ids = new Set(deleted.map((d) => d.id))
+      const walk = async (current, depth) => {
+        if (depth > 3) return
+        let entries
+        try {
+          entries = await readdir(current, { withFileTypes: true })
+        } catch {
+          return
+        }
+        for (const entry of entries) {
+          const full = join(current, entry.name)
+          if (entry.isDirectory()) {
+            await walk(full, depth + 1)
+            continue
+          }
+          const stem = entry.name.replace(/\.jsonl?$/i, '')
+          if (!ids.has(stem)) continue
+          try {
+            await unlink(full)
+            removedLogs += 1
+          } catch {
+            // 保留
+          }
+        }
+      }
+      await walk(dir, 0)
+    }
+
+    return { ok: true, deleted, errors, removedLogs }
+  }
+
   async function endMissions(sessionId, options = {}) {
     const team = services.team()
     const interrupted = []
     const stopped = []
+    const finishing = []
+    const closing = []
     for (const mission of [...missions.values()]) {
       if (sessionId && mission.sessionId !== sessionId) continue
       const agent = services.agents()?.get(mission.sessionId)
+      const allMembers = teammatesOf(agent)
+      const members = missionMembers(mission)
+      const root = workspaceOf(agent)
+      const boardDone = missionTasks(mission)
+        .filter((t) => t.status === 'completed')
+        .map((t) => t.subject)
+      const memberReports = members
+        .map((m) => {
+          const report = reports.get(String(m.id)) ?? {}
+          const done = [...(report.completed ?? [])]
+          const summary = done.length > 0 ? done.join('；') : (report.current || '')
+          return { name: m.name, summary }
+        })
+        .filter((r) => r.summary)
       if (agent && team) {
         // 「结束任务」要停掉所有子会话，不只本任务创建的成员
-        for (const member of teammatesOf(agent)) {
+        for (const member of allMembers) {
+          closing.push(member)
           if (member.status !== 'running' && member.status !== 'provisioning') continue
           try {
             team.interrupt(agent, member.name)
@@ -817,6 +1228,7 @@ export function apply(ctx, rawConfig) {
       }
       missions.delete(mission.sessionId)
       stopped.push(mission.sessionId)
+      finishing.push({ mission, members, boardDone, memberReports, root })
     }
 
     let cleanup = { deleted: [], errors: [], root: undefined }
@@ -824,7 +1236,41 @@ export function apply(ctx, rawConfig) {
       const firstAgent = stopped.map((id) => services.agents()?.get(id)).find(Boolean)
       cleanup = await cleanupTempFiles(workspaceOf(firstAgent))
     }
-    return { ok: true, stopped: stopped.length, sessionIds: stopped, interrupted, cleanup }
+
+    const deletedSet = new Set((cleanup.deleted ?? []).map((p) => resolve(p)))
+    // 关闭（归档）所有子会话，让侧边栏不再堆积历史工蜂
+    const closed = await closeChildSessions(closing)
+    const resultFiles = []
+    let leadNotified = false
+    for (const job of finishing) {
+      const files = collectResultFiles(job.members, deletedSet, job.root)
+      // 兜底：本任务开始后修改过的文件也算产出（覆盖 pwsh 等非结构化写入）
+      for (const file of scanRecentFiles(job.root, job.mission.startedAt - 2000, deletedSet)) {
+        if (!files.includes(file)) files.push(file)
+      }
+      for (const file of files) if (!resultFiles.includes(file)) resultFiles.push(file)
+      const notified = await askLeadToSummarize(job.mission, {
+        task: job.mission.task,
+        interrupted,
+        deleted: cleanup.deleted ?? [],
+        resultFiles: files,
+        boardDone: job.boardDone,
+        reports: job.memberReports,
+        closed: closed.archived ?? [],
+      })
+      leadNotified = leadNotified || notified
+    }
+
+    return {
+      ok: true,
+      stopped: stopped.length,
+      sessionIds: stopped,
+      interrupted,
+      cleanup,
+      resultFiles,
+      leadNotified,
+      closed,
+    }
   }
 
   if (ctx.webServer && typeof ctx.webServer.register === 'function') {
@@ -888,6 +1334,142 @@ export function apply(ctx, rawConfig) {
           dispose()
         } catch {
           // 已随旧 fiber 注销
+        }
+      }
+    })
+  }
+
+  // ── 蜂巢模式开关端点：会话头部的开关与人数选择调用 ──────────────────────
+  if (ctx.webServer && typeof ctx.webServer.register === 'function') {
+    ctx.effect(() => {
+      let dispose
+      try {
+        dispose = ctx.webServer.register({
+          kind: 'exact',
+          path: '/mission-mode-v1',
+          handler: (req, res) => {
+            const send = (status, payload, extraHeaders) => {
+              try {
+                res.writeHead(status, {
+                  'content-type': 'application/json; charset=utf-8',
+                  ...(extraHeaders ?? {}),
+                })
+                res.end(JSON.stringify(payload))
+              } catch {
+                // 连接可能已断开
+              }
+            }
+            if (req.method !== 'POST') {
+              send(405, { ok: false, error: 'method-not-allowed' }, { allow: 'POST' })
+              return
+            }
+            const chunks = []
+            req.on('data', (chunk) => chunks.push(chunk))
+            req.on('end', () => {
+              try {
+                const raw = Buffer.concat(chunks).toString('utf8')
+                const body = raw ? JSON.parse(raw) : {}
+                send(200, setMissionMode(body.sessionId, body))
+              } catch (error) {
+                send(400, {
+                  ok: false,
+                  error: String(error && error.message ? error.message : error),
+                })
+              }
+            })
+            req.on('error', () => send(400, { ok: false, error: 'request-error' }))
+          },
+        })
+      } catch {
+        return () => {}
+      }
+      return () => {
+        try {
+          dispose()
+        } catch {
+          // 已随旧 fiber 注销
+        }
+      }
+    })
+  }
+
+  // ── 子会话管理端点：列出 / 删除指定子会话 ───────────────────────────────
+  if (ctx.webServer && typeof ctx.webServer.register === 'function') {
+    const json = (res, status, payload, extra) => {
+      try {
+        res.writeHead(status, {
+          'content-type': 'application/json; charset=utf-8',
+          ...(extra ?? {}),
+        })
+        res.end(JSON.stringify(payload))
+      } catch {
+        // 连接已断开
+      }
+    }
+    const readBody = (req, onDone) => {
+      const chunks = []
+      req.on('data', (chunk) => chunks.push(chunk))
+      req.on('end', () => {
+        try {
+          const raw = Buffer.concat(chunks).toString('utf8')
+          onDone(raw ? JSON.parse(raw) : {})
+        } catch (error) {
+          onDone({ __error: errText(error) })
+        }
+      })
+      req.on('error', () => onDone({ __error: 'request-error' }))
+    }
+
+    ctx.effect(() => {
+      const disposers = []
+      try {
+        disposers.push(ctx.webServer.register({
+          kind: 'exact',
+          path: '/mission-children-v1',
+          handler: (req, res) => {
+            if (req.method !== 'GET') {
+              json(res, 405, { ok: false, error: 'method-not-allowed' }, { allow: 'GET' })
+              return
+            }
+            let sessionId
+            try {
+              const url = new URL(req.url ?? '/', 'http://127.0.0.1')
+              sessionId = url.searchParams.get('sessionId') ?? undefined
+            } catch {
+              // 无查询参数
+            }
+            json(res, 200, listChildSessions(sessionId))
+          },
+        }))
+        disposers.push(ctx.webServer.register({
+          kind: 'exact',
+          path: '/mission-delete-v1',
+          handler: (req, res) => {
+            if (req.method !== 'POST') {
+              json(res, 405, { ok: false, error: 'method-not-allowed' }, { allow: 'POST' })
+              return
+            }
+            readBody(req, (body) => {
+              if (body && body.__error) {
+                json(res, 400, { ok: false, error: body.__error })
+                return
+              }
+              deleteChildSessions(body.sessionId, body.childIds, { deleteLogs: body.deleteLogs === true })
+                .then((result) => json(res, 200, result))
+                .catch((error) => json(res, 500, { ok: false, error: errText(error) }))
+            })
+          },
+        }))
+      } catch {
+        return () => {}
+      }
+      return () => {
+        for (const dispose of disposers) {
+          try {
+            dispose()
+          } catch {
+            // 已注销
+          }
         }
       }
     })

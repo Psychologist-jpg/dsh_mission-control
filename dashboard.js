@@ -2,6 +2,7 @@ window.__ModuleLoader__.load({
   id: '@local/mission-control',
   factory(require) {
     const React = require('react');
+    const ReactDOM = require('react-dom');
     const h = React.createElement;
 
     const POLL_MS = 2000;
@@ -9,6 +10,9 @@ window.__ModuleLoader__.load({
     const POS_KEY = 'mission-control.window.position';
     const OPEN_KEY = 'mission-control.window.open';
     const STOP_ENDPOINT = '/mission-end-v1';
+    const MODE_ENDPOINT = '/mission-mode-v1';
+    const CHILDREN_ENDPOINT = '/mission-children-v1';
+    const DELETE_ENDPOINT = '/mission-delete-v1';
     const MARGIN = 16;
 
     // ── 主题 token（深色/浅色自动适配）──────────────────────────────────────
@@ -179,6 +183,369 @@ window.__ModuleLoader__.load({
       );
     }
 
+    /** 子会话上限选择器：自绘下拉，避免原生 select 弹层在深色主题下白底看不清。 */
+    function NumberPicker({ value, disabled, onChange }) {
+      const [open, setOpen] = React.useState(false);
+      const [rect, setRect] = React.useState(null);
+      const [hover, setHover] = React.useState(null);
+      const btnRef = React.useRef(null);
+
+      React.useEffect(() => {
+        if (!open) return undefined;
+        const onDown = (e) => {
+          const target = e.target;
+          if (target && target.closest && target.closest('[data-mission-picker]')) return;
+          setOpen(false);
+        };
+        const onKey = (e) => { if (e.key === 'Escape') setOpen(false); };
+        const onScroll = () => setOpen(false);
+        window.addEventListener('pointerdown', onDown, true);
+        window.addEventListener('keydown', onKey, true);
+        window.addEventListener('resize', onScroll);
+        window.addEventListener('scroll', onScroll, true);
+        return () => {
+          window.removeEventListener('pointerdown', onDown, true);
+          window.removeEventListener('keydown', onKey, true);
+          window.removeEventListener('resize', onScroll);
+          window.removeEventListener('scroll', onScroll, true);
+        };
+      }, [open]);
+
+      const toggle = () => {
+        if (disabled) return;
+        const el = btnRef.current;
+        if (el) setRect(el.getBoundingClientRect());
+        setOpen((v) => !v);
+        setHover(null);
+      };
+
+      const pick = (n) => {
+        setOpen(false);
+        onChange(n);
+      };
+
+      const btnStyle = {
+        display: 'inline-flex', alignItems: 'center', gap: 3,
+        minWidth: 40, height: 22, padding: '0 5px', borderRadius: 6,
+        border: `1px solid ${T.border}`, background: 'transparent',
+        color: T.text, fontFamily: 'inherit', fontSize: 12,
+        cursor: disabled ? 'default' : 'pointer', opacity: disabled ? 0.6 : 1,
+      };
+
+      const menu = open && rect
+        ? ReactDOM.createPortal(
+            h('div', {
+              'data-mission-picker': '1',
+              style: {
+                position: 'fixed',
+                left: Math.round(rect.left),
+                top: Math.round(rect.bottom + 4),
+                zIndex: 9999,
+                pointerEvents: 'auto',
+                minWidth: Math.max(56, Math.round(rect.width)),
+                maxHeight: 260,
+                overflowY: 'auto',
+                padding: 4,
+                borderRadius: 10,
+                border: `1px solid ${T.border}`,
+                background: T.panelBg,
+                backdropFilter: 'var(--dsw-menu-backdrop-filter, blur(12px))',
+                boxShadow: 'var(--dsw-elevation-prominent, 0 10px 32px rgba(0,0,0,.28))',
+                color: T.text,
+                fontFamily: 'inherit',
+                fontSize: 12,
+              },
+            }, ...[2,3,4,5,6,7,8,9,10].map((n) => h('div', {
+              key: n,
+              role: 'option',
+              'aria-selected': n === value,
+              onPointerEnter: () => setHover(n),
+              onPointerLeave: () => setHover((cur) => (cur === n ? null : cur)),
+              onClick: () => pick(n),
+              style: {
+                padding: '4px 8px', borderRadius: 6, cursor: 'pointer',
+                color: T.text,
+                background: n === value
+                  ? 'var(--dsw-alias-bg-layer-1, rgba(255,255,255,.08))'
+                  : (hover === n ? 'var(--dsw-alias-bg-layer-1, rgba(255,255,255,.06))' : 'transparent'),
+                fontWeight: n === value ? 600 : 400,
+                fontVariantNumeric: 'tabular-nums',
+              },
+            }, String(n)))),
+            document.body,
+          )
+        : null;
+
+      return h('span', { 'data-mission-picker': '1', style: { display: 'inline-flex', alignItems: 'center' } },
+        h('button', {
+          ref: btnRef,
+          type: 'button',
+          style: btnStyle,
+          disabled,
+          title: '子会话数量上限（2–10）',
+          'aria-label': '子会话数量上限',
+          'aria-haspopup': 'listbox',
+          'aria-expanded': open,
+          onClick: toggle,
+        }, String(value), h('span', { style: { color: T.secondary, fontSize: 9 } }, '▾')),
+        menu,
+      );
+    }
+
+    /** 子会话管理弹窗：勾选后删除（停止 + 归档，可选删日志）。 */
+    function ChildManager({ sessionId, onClose }) {
+      const [children, setChildren] = React.useState(null);
+      const [picked, setPicked] = React.useState(() => new Set());
+      const [busy, setBusy] = React.useState(false);
+      const [message, setMessage] = React.useState('');
+
+      const load = React.useCallback(async () => {
+        try {
+          const res = await fetch(`${CHILDREN_ENDPOINT}?sessionId=${encodeURIComponent(sessionId)}`, { cache: 'no-store' });
+          const data = await res.json();
+          setChildren(data.children || []);
+        } catch {
+          setChildren([]);
+        }
+      }, [sessionId]);
+
+      React.useEffect(() => { load(); }, [load]);
+
+      const toggle = (id) => {
+        setPicked((prev) => {
+          const next = new Set(prev);
+          if (next.has(id)) next.delete(id); else next.add(id);
+          return next;
+        });
+      };
+      const allPicked = children && children.length > 0 && picked.size === children.length;
+      const toggleAll = () => {
+        setPicked(allPicked ? new Set() : new Set((children || []).map((c) => c.id)));
+      };
+
+      const remove = async () => {
+        if (busy || picked.size === 0) return;
+        const names = (children || []).filter((c) => picked.has(c.id)).map((c) => c.name);
+        const ask = `确定删除以下 ${names.length} 个子会话？\n\n${names.join('、')}\n\n会话将被停止并归档（从侧边栏移除）。`;
+        if (typeof window.confirm === 'function' && !window.confirm(ask)) return;
+        setBusy(true);
+        setMessage('');
+        try {
+          const res = await fetch(DELETE_ENDPOINT, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ sessionId, childIds: [...picked], deleteLogs: false }),
+          });
+          const result = await res.json().catch(() => ({}));
+          const okCount = (result.deleted || []).length;
+          const errs = (result.errors || []).length;
+          setMessage(`已删除 ${okCount} 个子会话${errs ? `，${errs} 个失败` : ''}`);
+          setPicked(new Set());
+          await load();
+        } catch {
+          setMessage('删除失败：无法连接插件端点');
+        } finally {
+          setBusy(false);
+        }
+      };
+
+      const overlay = {
+        position: 'fixed', inset: 0, zIndex: 10000, pointerEvents: 'auto',
+        background: 'rgba(0,0,0,.35)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+      };
+      const panel = {
+        width: 'min(520px, calc(100vw - 48px))',
+        maxHeight: 'min(70vh, 640px)',
+        display: 'flex', flexDirection: 'column',
+        borderRadius: 12, border: `1px solid ${T.border}`,
+        background: T.panelBg, backdropFilter: 'var(--dsw-menu-backdrop-filter, blur(12px))',
+        boxShadow: 'var(--dsw-elevation-prominent, 0 16px 44px rgba(0,0,0,.35))',
+        color: T.text, fontFamily: 'inherit', fontSize: 13, overflow: 'hidden',
+      };
+      const rowStyle = {
+        display: 'flex', alignItems: 'center', gap: 8,
+        padding: '7px 10px', borderRadius: 8, cursor: 'pointer',
+      };
+
+      const body = !children
+        ? h('div', { style: { padding: 16, color: T.secondary } }, '加载中…')
+        : children.length === 0
+          ? h('div', { style: { padding: 16, color: T.secondary } }, '当前没有子会话。')
+          : h('div', { style: { padding: '6px 8px', overflowY: 'auto' } },
+              h('label', { style: { ...rowStyle, color: T.secondary, fontSize: 12 } },
+                h('input', { type: 'checkbox', checked: Boolean(allPicked), onChange: toggleAll }),
+                '全选',
+                h('span', { style: { marginLeft: 'auto' } }, `${children.length} 个子会话`),
+              ),
+              ...children.map((child) => h('label', { key: child.id, style: rowStyle },
+                h('input', {
+                  type: 'checkbox',
+                  checked: picked.has(child.id),
+                  onChange: () => toggle(child.id),
+                }),
+                h('span', { style: { fontWeight: 500 } }, child.name),
+                h('span', {
+                  style: {
+                    fontSize: 11, padding: '0 6px', borderRadius: 9, lineHeight: '16px',
+                    border: `1px solid ${child.status === 'running' ? T.brand : T.idle}`,
+                    color: child.status === 'running' ? T.brand : T.secondary,
+                  },
+                }, child.status === 'running' ? '运行中' : '空闲'),
+                h('span', {
+                  style: { marginLeft: 'auto', color: T.secondary, fontSize: 11, maxWidth: 160,
+                    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+                  title: child.description || '',
+                }, child.description || ''),
+              )),
+            );
+
+      return ReactDOM.createPortal(
+        h('div', {
+          style: overlay,
+          onPointerDown: (e) => { if (e.target === e.currentTarget) onClose(); },
+        },
+          h('div', { style: panel, role: 'dialog', 'aria-label': '子会话管理' },
+            h('div', {
+              style: { display: 'flex', alignItems: 'center', gap: 8, padding: '10px 12px',
+                borderBottom: `1px solid ${T.border}`, fontWeight: 600 },
+            }, '子会话管理', h('span', { style: { marginLeft: 'auto' } })),
+            body,
+            message ? h('div', { style: { padding: '0 12px 6px', color: T.success, fontSize: 12 } }, message) : null,
+            h('div', {
+              style: { display: 'flex', gap: 8, justifyContent: 'flex-end',
+                padding: '10px 12px', borderTop: `1px solid ${T.border}` },
+            },
+              h('button', {
+                type: 'button',
+                onClick: onClose,
+                style: { padding: '4px 12px', borderRadius: 8, border: `1px solid ${T.border}`,
+                  background: 'transparent', color: T.text, cursor: 'pointer', fontFamily: 'inherit', fontSize: 12 },
+              }, '关闭'),
+              h('button', {
+                type: 'button',
+                disabled: busy || picked.size === 0,
+                onClick: remove,
+                style: { padding: '4px 12px', borderRadius: 8, border: `1px solid ${T.error}`,
+                  background: 'transparent', color: T.error, cursor: picked.size === 0 ? 'default' : 'pointer',
+                  opacity: busy || picked.size === 0 ? 0.5 : 1, fontFamily: 'inherit', fontSize: 12 },
+              }, busy ? '删除中…' : `删除所选（${picked.size}）`),
+            ),
+          ),
+        ),
+        document.body,
+      );
+    }
+
+    /** 会话头部的蜂巢模式开关 + 子会话上限选择（2–10）。 */
+    function HiveToggle(props) {
+      const sessionId = props.sessionId;
+      const [state, setState] = React.useState({ active: false, enabled: false, cap: 3 });
+      const [busy, setBusy] = React.useState(false);
+      const [showManager, setShowManager] = React.useState(false);
+
+      const load = React.useCallback(async () => {
+        try {
+          const res = await fetch(ENDPOINT, { cache: 'no-store' });
+          const data = await res.json();
+          const mine = (data.missions || []).find((m) => m.sessionId === sessionId);
+          setState({
+            active: Boolean(mine),
+            enabled: Boolean(mine) && mine.paused !== true,
+            cap: mine && Number.isFinite(mine.cap) ? mine.cap : 3,
+          });
+        } catch {
+          // 忽略，保留上一次状态
+        }
+      }, [sessionId]);
+
+      React.useEffect(() => {
+        let alive = true;
+        load();
+        const timer = setInterval(() => { if (alive) load(); }, 3000);
+        return () => { alive = false; clearInterval(timer); };
+      }, [load]);
+
+      const push = async (enabled, cap) => {
+        if (busy) return;
+        setBusy(true);
+        setState((s) => ({ ...s, active: enabled ? true : s.active, enabled }));
+        try {
+          const res = await fetch(MODE_ENDPOINT, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ sessionId, enabled, workers: cap }),
+          });
+          const result = await res.json().catch(() => ({}));
+          if (result && result.ok) {
+            setState({
+              active: Boolean(result.active),
+              enabled: Boolean(result.enabled),
+              cap: Number.isFinite(result.cap) ? result.cap : cap,
+            });
+          } else {
+            await load();
+          }
+        } catch {
+          await load();
+        } finally {
+          setBusy(false);
+        }
+      };
+
+      const onToggle = () => push(!state.enabled, state.cap);
+
+      const tunStyle = {
+        display: 'inline-flex', alignItems: 'center', gap: 6,
+        padding: '0 6px', height: 26, borderRadius: 8,
+        color: T.text, fontFamily: 'inherit', fontSize: 12,
+      };
+
+      const switchStyle = {
+        position: 'relative', width: 34, height: 18, borderRadius: 9,
+        border: `1px solid ${state.enabled ? T.success : T.border}`,
+        background: state.enabled ? T.success : 'transparent',
+        cursor: busy ? 'default' : 'pointer', flex: 'none',
+        opacity: busy ? 0.6 : 1, padding: 0, transition: 'background .18s ease',
+      };
+      const knob = {
+        position: 'absolute', top: 1.5, left: state.enabled ? 17 : 1.5,
+        width: 13, height: 13, borderRadius: '50%',
+        background: state.enabled ? '#fff' : T.secondary,
+        transition: 'left .18s ease',
+      };
+
+      const label = !state.active ? '普通' : state.enabled ? '蜂巢' : '已暂停';
+
+      return h('span', { style: tunStyle, title: '蜂巢会话模式：开启后主会话的消息会下发给子会话' },
+        h('button', {
+          type: 'button', role: 'switch', 'aria-checked': state.enabled,
+          'aria-label': '蜂巢会话模式开关',
+          style: switchStyle, disabled: busy, onClick: onToggle,
+        }, h('span', { style: knob })),
+        h('span', { style: { color: state.enabled ? T.success : T.secondary, whiteSpace: 'nowrap' } }, label),
+        h(NumberPicker, {
+          value: state.cap,
+          disabled: busy,
+          onChange: (n) => { push(state.enabled || state.active, n); },
+        }),
+        h('span', { style: { color: T.secondary, fontSize: 11 } }, '个'),
+        h('button', {
+          type: 'button',
+          title: '管理子会话（可勾选删除）',
+          'aria-label': '管理子会话',
+          onClick: () => setShowManager(true),
+          style: {
+            display: 'inline-flex', alignItems: 'center', height: 22, padding: '0 7px',
+            borderRadius: 6, border: `1px solid ${T.border}`, background: 'transparent',
+            color: T.secondary, fontFamily: 'inherit', fontSize: 12, cursor: 'pointer',
+            marginLeft: 2,
+          },
+        }, '子会话'),
+        showManager ? h(ChildManager, { sessionId, onClose: () => setShowManager(false) }) : null,
+      );
+    }
+
     /** 悬浮窗：固定在页面上方，可拖动、可折叠，位置与折叠状态写入 localStorage。 */
     function FloatingWindow() {
       const snap = useDashboard();
@@ -247,6 +614,7 @@ window.__ModuleLoader__.load({
         completed += board.completed || 0;
       }
       const pct = total > 0 ? Math.round((completed / total) * 100) : 0;
+      const paused = missions.some((m) => m.paused === true);
 
       const toggle = () => {
         setOpen((v) => {
@@ -340,8 +708,9 @@ window.__ModuleLoader__.load({
           const result = await res.json().catch(() => ({}));
           const deleted = (result.cleanup && result.cleanup.deleted) || [];
           const interrupted = result.interrupted || [];
+          const files = result.resultFiles || [];
           setEnded({
-            summary: `已停止 ${interrupted.length} 个子会话 · 清理 ${deleted.length} 个临时文件`,
+            summary: `已停止 ${interrupted.length} 个子会话 · 清理 ${deleted.length} 个临时文件 · 保留 ${files.length} 个结果文件${result.leadNotified ? ' · 已请求主会话汇总' : ''}`,
           });
         } catch {
           // 网络失败时保持面板不动，轮询会显示真实状态
@@ -367,7 +736,7 @@ window.__ModuleLoader__.load({
       },
         h('span', { style: s.dot(runningCount > 0 ? T.brand : T.success) }),
         h('span', { style: s.title }, '蜂巢任务'),
-        h('span', { style: s.meta }, `${mateCount} 工蜂${runningCount ? ` · ${runningCount} 工作中` : ' · 全部空闲'}`),
+        h('span', { style: s.meta }, `${mateCount} 工蜂${runningCount ? ` · ${runningCount} 工作中` : ' · 全部空闲'}${paused ? ' · 已暂停' : ''}`),
         open ? h('span', { style: s.bar }, h('span', { style: s.barFill(pct, T.success) })) : null,
         open ? h('span', { style: s.meta }, `${pct}%`) : null,
         open ? h('button', {
@@ -410,7 +779,13 @@ window.__ModuleLoader__.load({
     return {
       inject: ['slots', 'locale'],
       apply(ctx) {
-        // 全局悬浮层：只在需要覆盖整页的悬浮 UI 时使用
+        // 会话头部：蜂巢模式开关 + 子会话上限选择
+        ctx.slots.inject('conversation.session.header.actions', () => ctx.slots.register({
+          name: 'conversation.session.header.actions',
+          id: 'mission-hive-toggle',
+          order: -25,
+        }, HiveToggle));
+        // 全局悬浮层：蜂巢任务监控面板
         ctx.slots.inject('shell.overlay', () => ctx.slots.register({
           name: 'shell.overlay',
           id: 'mission-dashboard',
