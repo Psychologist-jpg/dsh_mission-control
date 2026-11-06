@@ -16,9 +16,9 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Psychologist-jpg/mission-control.git"
+    "url": "git+https://github.com/Psychologist-jpg/dsh_mission-control.git"
   },
-  "homepage": "https://github.com/Psychologist-jpg/mission-control#readme",
+  "homepage": "https://github.com/Psychologist-jpg/dsh_mission-control#readme",
   "peerDependencies": {
     "@deepseek-ai/dsh-experimental-agent-team": "0.2.2-rc.1",
     "@deepseek-ai/cordis": "~4.1.0"

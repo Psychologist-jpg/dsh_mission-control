@@ -78,7 +78,7 @@ Mission Control 让一个 Lead 会话把多个工蜂组织成一场「任务（M
 1. 克隆仓库到本地：
 
    ```bash
-   git clone https://github.com/Psychologist-jpg/mission-control.git
+   git clone https://github.com/Psychologist-jpg/dsh_mission-control.git
    ```
 
 2. 在 DSH profile 的 `package.json`（通常位于 `~/.dsh/profiles/<profile>/package.json`）里加入依赖与 bundle：
