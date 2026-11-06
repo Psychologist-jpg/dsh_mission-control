@@ -62,7 +62,18 @@ Mission Control 让一个 Lead 会话把多个工蜂组织成一场「任务（M
 
 ## 安装与启用
 
-本插件以 **profile 本地链接（link）** 方式安装，不依赖 npm 发包。
+本插件以 **profile 本地链接（link）** 方式安装，不依赖 npm 发包。它**强依赖** DSH 实验性智能体团队插件，安装前需先准备好该依赖。
+
+### 前置依赖
+
+本插件在 `package.json` 的 `peerDependencies` 中声明了：
+
+- `@deepseek-ai/dsh-experimental-agent-team`（提供 `agentTeams` 服务，必需）
+- `@deepseek-ai/cordis`（DSH 宿主底座）
+
+由于采用 `link:` 安装时包管理器不会自动补装 peer 依赖，请显式把聚合包 `@deepseek-ai/dsh-experimental-agent-team-profile`（内含核心 + 工具 + 客户端 UI）加入 profile 的 `dependencies` 与 `bundles`。
+
+### 步骤
 
 1. 克隆仓库到本地：
 
@@ -75,12 +86,14 @@ Mission Control 让一个 Lead 会话把多个工蜂组织成一场「任务（M
    ```jsonc
    {
      "dependencies": {
+       "@deepseek-ai/dsh-experimental-agent-team-profile": "0.2.2-rc.1",
        "@local/mission-control": "link:C:/path/to/mission-control"
      },
      "dsh": {
        "profile": {
          "bundles": [
-           // ... 其他官方 bundle，例如 @deepseek-ai/dsh-experimental-agent-team-profile
+           // ... 其他官方 bundle
+           "@deepseek-ai/dsh-experimental-agent-team-profile",
            "@local/mission-control"
          ]
        }
@@ -88,9 +101,11 @@ Mission Control 让一个 Lead 会话把多个工蜂组织成一场「任务（M
    }
    ```
 
-3. 让 profile 重新安装依赖并重载 DSH 客户端。启动新会话后，会话头部出现蜂巢模式开关，页面右下角出现「蜂巢任务」悬浮窗，`mission_start` / `mission_report` / `mission_status` / `mission_stop` 四个工具也在工具列表中。
+3. 让 profile 重新安装依赖（`pnpm install` 或由 DSH 桌面端触发）并重载客户端。
 
-> 依赖 Agent Teams：本插件在 `package.json` 的 `peerDependencies` 中**强依赖** DSH 的实验性智能体团队插件 `@deepseek-ai/dsh-experimental-agent-team`（提供 `agentTeams` 服务）。此外还读取 `agents`、`sessions`、`tokenMeter`、`systemPrompt`、`webServer`、`workingDirectory`、`workspaceRegistry`、`sessionController` 等服务，因此 profile 中需要启用 `@deepseek-ai/dsh-experimental-agent-team-profile` 聚合包（或提供同名服务的等价包）。
+4. 启动新会话后，会话头部出现蜂巢模式开关，页面右下角出现「蜂巢任务」悬浮窗，`mission_start` / `mission_report` / `mission_status` / `mission_stop` 四个工具也在工具列表中。
+
+> 依赖 Agent Teams：本插件读取 `agentTeams`（由 `@deepseek-ai/dsh-experimental-agent-team` 提供）、`agents`、`sessions`、`tokenMeter`、`systemPrompt`、`webServer`、`workingDirectory`、`workspaceRegistry`、`sessionController` 等服务；若你的 profile 已由其他 bundle 提供同名服务，可省略上面的 profile 聚合包，但必须保证 `agentTeams` 服务可用。
 
 ---
 
@@ -153,7 +168,7 @@ mission-control/
 │   ├── en.json         # 英文标题与描述
 │   └── zh.json         # 中文标题与描述
 ├── icon.svg            # 插件图标
-└── package.json        # 包元数据与 dsh.bundle / dsh.client 声明
+└── package.json        # 包元数据（含 peerDependencies 强依赖声明）与 dsh.bundle / dsh.client 声明
 ```
 
 ---
