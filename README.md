@@ -90,7 +90,7 @@ Mission Control 让一个 Lead 会话把多个工蜂组织成一场「任务（M
 
 3. 让 profile 重新安装依赖并重载 DSH 客户端。启动新会话后，会话头部出现蜂巢模式开关，页面右下角出现「蜂巢任务」悬浮窗，`mission_start` / `mission_report` / `mission_status` / `mission_stop` 四个工具也在工具列表中。
 
-> 依赖 Agent Teams：本插件读取 `agentTeams`、`agents`、`sessions`、`tokenMeter`、`systemPrompt`、`webServer`、`workingDirectory`、`workspaceRegistry`、`sessionController` 等服务，因此 profile 中需要启用 `@deepseek-ai/dsh-experimental-agent-team-profile`（或提供同名服务的等价包）。
+> 依赖 Agent Teams：本插件在 `package.json` 的 `peerDependencies` 中**强依赖** DSH 的实验性智能体团队插件 `@deepseek-ai/dsh-experimental-agent-team`（提供 `agentTeams` 服务）。此外还读取 `agents`、`sessions`、`tokenMeter`、`systemPrompt`、`webServer`、`workingDirectory`、`workspaceRegistry`、`sessionController` 等服务，因此 profile 中需要启用 `@deepseek-ai/dsh-experimental-agent-team-profile` 聚合包（或提供同名服务的等价包）。
 
 ---
 
