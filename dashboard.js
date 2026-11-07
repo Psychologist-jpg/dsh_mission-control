@@ -13,6 +13,7 @@ window.__ModuleLoader__.load({
     const MODE_ENDPOINT = '/mission-mode-v1';
     const CHILDREN_ENDPOINT = '/mission-children-v1';
     const DELETE_ENDPOINT = '/mission-delete-v1';
+    const ARCHIVE_ENDPOINT = '/mission-archive-v1';
     const MARGIN = 16;
 
     // ── 主题 token（深色/浅色自动适配）──────────────────────────────────────
@@ -301,12 +302,17 @@ window.__ModuleLoader__.load({
       const [picked, setPicked] = React.useState(() => new Set());
       const [busy, setBusy] = React.useState(false);
       const [message, setMessage] = React.useState('');
+      const [archivedCount, setArchivedCount] = React.useState(0);
+      const [deletedCount, setDeletedCount] = React.useState(0);
 
       const load = React.useCallback(async () => {
         try {
-          const res = await fetch(`${CHILDREN_ENDPOINT}?sessionId=${encodeURIComponent(sessionId)}`, { cache: 'no-store' });
+          const url = `${CHILDREN_ENDPOINT}?sessionId=${encodeURIComponent(sessionId)}&includeArchived=1&includeDeleted=1`;
+          const res = await fetch(url, { cache: 'no-store' });
           const data = await res.json();
           setChildren(data.children || []);
+          setArchivedCount(Number(data.archivedCount) || 0);
+          setDeletedCount(Number(data.deletedCount) || 0);
         } catch {
           setChildren([]);
         }
@@ -326,10 +332,57 @@ window.__ModuleLoader__.load({
         setPicked(allPicked ? new Set() : new Set((children || []).map((c) => c.id)));
       };
 
+      const archive = async (action) => {
+        if (busy || picked.size === 0) return;
+        const isRestore = action === 'unarchive';
+        const names = (children || []).filter((c) => picked.has(c.id)).map((c) => c.name);
+        const ask = isRestore
+          ? `确定取消归档以下 ${names.length} 个子会话？\n\n${names.join('、')}\n\n它们会重新出现在会话列表中。`
+          : [
+              `确定归档以下 ${names.length} 个子会话？`,
+              '',
+              names.join('、'),
+              '',
+              '· 会话被停止',
+              '· 从会话列表移走，日志保留',
+              '· 之后可「取消归档」恢复',
+            ].join('\n');
+        if (typeof window.confirm === 'function' && !window.confirm(ask)) return;
+        setBusy(true);
+        setMessage('');
+        try {
+          const res = await fetch(ARCHIVE_ENDPOINT, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ sessionId, childIds: [...picked], action: isRestore ? 'unarchive' : 'archive' }),
+          });
+          const result = await res.json().catch(() => ({}));
+          const okCount = ((isRestore ? result.restored : result.archived) || []).length;
+          const errs = (result.errors || []).length;
+          setMessage(`${isRestore ? '已取消归档' : '已归档'} ${okCount} 个子会话${errs ? `，${errs} 个失败` : ''}`);
+          setPicked(new Set());
+          await load();
+        } catch {
+          setMessage('操作失败：无法连接插件端点');
+        } finally {
+          setBusy(false);
+        }
+      };
+
       const remove = async () => {
         if (busy || picked.size === 0) return;
         const names = (children || []).filter((c) => picked.has(c.id)).map((c) => c.name);
-        const ask = `确定删除以下 ${names.length} 个子会话？\n\n${names.join('、')}\n\n会话将被停止并归档（从侧边栏移除）。`;
+        const ask = [
+          `确定彻底删除以下 ${names.length} 个子会话？`,
+          '',
+          names.join('、'),
+          '',
+          '· 会话被立即停止',
+          '· 会话日志与缓存从磁盘删除',
+          '· 不再出现在任何列表中',
+          '',
+          '此操作不可恢复。',
+        ].join('\n');
         if (typeof window.confirm === 'function' && !window.confirm(ask)) return;
         setBusy(true);
         setMessage('');
@@ -337,12 +390,13 @@ window.__ModuleLoader__.load({
           const res = await fetch(DELETE_ENDPOINT, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ sessionId, childIds: [...picked], deleteLogs: false }),
+            body: JSON.stringify({ sessionId, childIds: [...picked], hard: true }),
           });
           const result = await res.json().catch(() => ({}));
           const okCount = (result.deleted || []).length;
           const errs = (result.errors || []).length;
-          setMessage(`已删除 ${okCount} 个子会话${errs ? `，${errs} 个失败` : ''}`);
+          const logs = Number(result.removedLogs) || 0;
+          setMessage(`已彻底删除 ${okCount} 个子会话（清除 ${logs} 份会话日志）${errs ? `，${errs} 个失败` : ''}`);
           setPicked(new Set());
           await load();
         } catch {
@@ -373,35 +427,53 @@ window.__ModuleLoader__.load({
 
       const body = !children
         ? h('div', { style: { padding: 16, color: T.secondary } }, '加载中…')
-        : children.length === 0
-          ? h('div', { style: { padding: 16, color: T.secondary } }, '当前没有子会话。')
-          : h('div', { style: { padding: '6px 8px', overflowY: 'auto' } },
-              h('label', { style: { ...rowStyle, color: T.secondary, fontSize: 12 } },
-                h('input', { type: 'checkbox', checked: Boolean(allPicked), onChange: toggleAll }),
-                '全选',
-                h('span', { style: { marginLeft: 'auto' } }, `${children.length} 个子会话`),
-              ),
-              ...children.map((child) => h('label', { key: child.id, style: rowStyle },
-                h('input', {
-                  type: 'checkbox',
-                  checked: picked.has(child.id),
-                  onChange: () => toggle(child.id),
-                }),
-                h('span', { style: { fontWeight: 500 } }, child.name),
-                h('span', {
-                  style: {
-                    fontSize: 11, padding: '0 6px', borderRadius: 9, lineHeight: '16px',
-                    border: `1px solid ${child.status === 'running' ? T.brand : T.idle}`,
-                    color: child.status === 'running' ? T.brand : T.secondary,
-                  },
-                }, child.status === 'running' ? '运行中' : '空闲'),
-                h('span', {
-                  style: { marginLeft: 'auto', color: T.secondary, fontSize: 11, maxWidth: 160,
-                    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
-                  title: child.description || '',
-                }, child.description || ''),
-              )),
-            );
+        : h('div', { style: { padding: '6px 8px', overflowY: 'auto' } },
+            h('div', { style: { display: 'flex', alignItems: 'center', gap: 10, padding: '2px 10px 6px',
+              color: T.secondary, fontSize: 12, flexWrap: 'wrap' } },
+              h('span', null, `普通 ${(children || []).filter((c) => c.exists && !c.archived).length}`),
+              h('span', null, `归档 ${archivedCount}`),
+              h('span', null, `已删除 ${deletedCount}`),
+            ),
+            children.length === 0
+              ? h('div', { style: { padding: '10px 8px', color: T.secondary, fontSize: 12 } }, '当前没有子会话。')
+              : null,
+            ...children.map((child, index) => {
+              // 组标题：普通 / 归档 / 已删除
+              const rank = !child.exists ? 2 : child.archived ? 1 : 0
+              const prevRank = index === 0
+                ? -1
+                : (() => { const p = children[index - 1]; return !p.exists ? 2 : p.archived ? 1 : 0 })()
+              const groupTitle = rank !== prevRank
+                ? (rank === 0 ? '普通会话' : rank === 1 ? '归档会话' : '已删除会话')
+                : null
+              return h(React.Fragment, { key: child.id },
+                groupTitle
+                  ? h('div', { style: { padding: '6px 10px 2px', color: T.secondary, fontSize: 11, fontWeight: 600 } }, groupTitle)
+                  : null,
+                h('label', { style: { ...rowStyle, opacity: child.exists ? 1 : 0.55 } },
+                  h('input', {
+                    type: 'checkbox',
+                    checked: picked.has(child.id),
+                    disabled: !child.exists,
+                    onChange: () => toggle(child.id),
+                  }),
+                  h('span', { style: { fontWeight: 500 } }, child.name),
+                  h('span', {
+                    style: {
+                      fontSize: 11, padding: '0 6px', borderRadius: 9, lineHeight: '16px',
+                      border: `1px solid ${!child.exists ? T.error : child.archived ? T.border : child.status === 'running' ? T.brand : T.idle}`,
+                      color: !child.exists ? T.error : child.archived ? T.secondary : child.status === 'running' ? T.brand : T.secondary,
+                    },
+                  }, !child.exists ? '已删除' : child.archived ? '已归档' : child.status === 'running' ? '运行中' : '空闲'),
+                  h('span', {
+                    style: { marginLeft: 'auto', color: T.secondary, fontSize: 11, maxWidth: 160,
+                      overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+                    title: child.description || '',
+                  }, child.description || ''),
+                ),
+              )
+            }),
+          );
 
       return ReactDOM.createPortal(
         h('div', {
@@ -428,11 +500,30 @@ window.__ModuleLoader__.load({
               h('button', {
                 type: 'button',
                 disabled: busy || picked.size === 0,
+                onClick: () => archive('archive'),
+                title: '归档（可恢复）：从会话列表移走，日志保留',
+                style: { padding: '4px 12px', borderRadius: 8, border: `1px solid ${T.brand}`,
+                  background: 'transparent', color: T.brand, cursor: picked.size === 0 ? 'default' : 'pointer',
+                  opacity: busy || picked.size === 0 ? 0.5 : 1, fontFamily: 'inherit', fontSize: 12 },
+              }, busy ? '处理中…' : `归档所选（${picked.size}）`),
+              h('button', {
+                type: 'button',
+                disabled: busy || picked.size === 0,
+                onClick: () => archive('unarchive'),
+                title: '取消归档：让会话重新出现在列表中',
+                style: { padding: '4px 12px', borderRadius: 8, border: `1px solid ${T.border}`,
+                  background: 'transparent', color: T.secondary, cursor: picked.size === 0 ? 'default' : 'pointer',
+                  opacity: busy || picked.size === 0 ? 0.5 : 1, fontFamily: 'inherit', fontSize: 12 },
+              }, '取消归档'),
+              h('button', {
+                type: 'button',
+                disabled: busy || picked.size === 0,
                 onClick: remove,
+                title: '彻底删除（不可恢复）',
                 style: { padding: '4px 12px', borderRadius: 8, border: `1px solid ${T.error}`,
                   background: 'transparent', color: T.error, cursor: picked.size === 0 ? 'default' : 'pointer',
                   opacity: busy || picked.size === 0 ? 0.5 : 1, fontFamily: 'inherit', fontSize: 12 },
-              }, busy ? '删除中…' : `删除所选（${picked.size}）`),
+              }, busy ? '删除中…' : `彻底删除（${picked.size}）`),
             ),
           ),
         ),
