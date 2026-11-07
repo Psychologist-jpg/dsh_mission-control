@@ -8,45 +8,51 @@ Mission Control 让一个 Lead 会话把多个工蜂组织成一场「任务（M
 
 ## 功能特性
 
-### 四个工具
+### 五个工具
 
 | 工具 | 作用 |
 | --- | --- |
-| `mission_start` | 在本会话声明一个任务，记录任务目标与并发工蜂上限 `workers`；之后才允许 `spawn_teammate`，超出上限的创建请求会被直接拒绝。 |
+| `mission_start` | 在本会话声明一个任务，记录任务目标与并发工蜂上限 `workers`；之后才允许创建工蜂，超出上限的创建请求会被直接拒绝。重复调用可更新任务目标与上限。 |
+| `mission_scale` | 按需**只补差额**地开子会话：传入期望的子会话清单（名称 + 自包含子任务），已存在的跳过、超出上限的拒绝，一次调用完成配平，避免逐个 spawn。 |
 | `mission_report` | 工蜂自报工作概括：`current`（此刻在做什么）与 `completed`（刚做完什么），每行一句短中文，驾驶舱面板据此显示人话进度。 |
 | `mission_status` | 只读地读取任务实时状态：每个工蜂的运行状态、上下文 token 占窗口比例、当前承担的任务。 |
 | `mission_stop` | 结束本会话上的任务：清除人数上限并停止上下文哨兵。 |
 
-> 也可以不用 `mission_start`：会话头部的「蜂巢模式开关」会按 `defaultCap` 建一个占位任务（目标为「等待任务…」，待 Lead 说明后再分配）。
+> 也可以不用 `mission_start`：会话头部的「蜂巢模式开关」会按 `defaultCap` 建一个占位任务（目标为「等待任务…」），**首条人类消息会自动写入为该任务的真实目标**（`taskAt` 标记已设目标）。
 
 ### 支撑机制
 
 1. **人数上限守卫（Workers Cap）**
-   `mission_start`（或头部开关）用 `workers` 设定硬上限；`ctx.tools.guard` 在每次 `spawn_teammate` 前检查当前任务中处于 `running` / `provisioning` 的成员数，超限即拒绝，避免任务失控复制会话。
+   `mission_start`（或头部开关）用 `workers` 设定硬上限；`ctx.tools.guard` 在每次 `spawn_teammate` 前检查当前任务中处于 `running` / `provisioning` 的成员数，超限即拒绝，避免任务失控复制会话。`mission_scale` 内部同样受该上限约束。
 
-2. **上下文哨兵与自动交接（Context Sentinel & Handoff）**
+2. **任务拆解与人数配平（Mission Scale）**
+   `missionScale()` 从任务板实时推算配平统计：待办/进行中的子任务数、未认领数、现有工蜂数、上限，以及「目标人数 = min(待认领子任务数, 上限)」与缺口 `gap`。这份统计会：
+   - 通过 `/mission-dashboard-v2.json` 的 `scale` 字段输出，悬浮窗标题栏显示 `${workers}/${cap} 工蜂 · 待办 N · 建议再开 M`；
+   - 驱动提示词：Lead 侧注入「先 `mission_start` → 建任务板 → 算人数 → `mission_scale` 一次开齐 → 自己只做协调验收」的分派契约；若已收到任务但工蜂不足，则改为强制催办「现在必须再开 N 个」；子会话侧则注入「只做分配的活 + 汇报」的身份约束。
+
+3. **上下文哨兵与自动交接（Context Sentinel & Handoff）**
    哨兵按 `pollIntervalMs` 定时用 `tokenMeter` 测量每个工蜂的上下文占用（分母取会话的 `contextWindow`，取不到时退回 `fallbackContextWindow`）。比例达到 `handoffRatio` 时：
    - 中断该成员；
    - 生成一份交接摘要（任务目标、任务板现状、前任最近 4 条进展记录、续任职责）；
    - 以 `fresh` 上下文新建续任者 `<name>-rN`，接手原成员未完成的工作。
 
-3. **驾驶舱广播（Cockpit Broadcast）**
+4. **驾驶舱广播（Cockpit Broadcast）**
    任务进行中，人类在本会话发出的 `user/message` 会被立即包装成 `[驾驶舱广播] ...` 扇出给当前任务的全部工蜂，不必等 Lead 跑一轮模型再转述。**暂停时不下发**，但子会话仍继续工作。
 
-4. **蜂巢模式开关与子会话管理（Hive Mode）**
+5. **蜂巢模式开关与子会话管理（Hive Mode）**
    会话头部注入一个开关（`普通 / 蜂巢 / 已暂停`）+ 人数上限选择（2–10）+ 「子会话」管理弹窗：
    - 开启：建任务（或恢复暂停），主会话消息开始下发；
    - 关闭（暂停）：子会话继续工作，但主会话消息不再下发给子会话；
    - 「子会话」弹窗：列出该会话下所有子会话（名称、状态、描述），勾选后停止并归档（从侧边栏移除），可选删除其日志。
 
-5. **实时进度悬浮窗（Dashboard）**
+6. **实时进度悬浮窗（Dashboard）**
    `dashboard.js` 在 Web 客户端注入悬浮层（`shell.overlay`），每 2 秒轮询 `/mission-dashboard-v2.json`，**每个主会话渲染一个独立悬浮窗**：
    - 可拖动、可折叠，位置与折叠状态按会话分别保存在 `localStorage`，多窗口默认错开不重叠；
    - 标题显示会话标题（来自 `sessionTitle` 服务，取不到则回退「会话 <id 尾号>」）；
-   - 显示工蜂状态徽标、上下文占用进度条（绿 → 黄 → 红）、当前任务、已完成任务、产出文件、暂停状态；
+   - 显示配平统计（现有/上限工蜂、待办数、建议再开数）、工蜂状态徽标、上下文占用进度条（绿 → 黄 → 红）、当前任务、已完成任务、产出文件、暂停状态；
    - 「结束任务」按钮会先确认，再 `POST /mission-end-v1` 执行完整收尾；结束后弹出可拖动、可关闭的结束提示卡片，15 秒后自动消失。
 
-   另外，任务进行中会通过 `systemPrompt.section` 注入一段「工作汇报」引导，促使工蜂主动调用 `mission_report`；没有任务时不注入任何内容。
+   另外，任务进行中会通过 `systemPrompt.section` 注入「分派契约 / 催办 / 汇报」三段式提示（见上文「任务拆解与人数配平」）；没有任务时不注入任何内容。
 
 ### 结束任务（完整收尾）
 
@@ -103,7 +109,7 @@ Mission Control 让一个 Lead 会话把多个工蜂组织成一场「任务（M
 
 3. 让 profile 重新安装依赖（`pnpm install` 或由 DSH 桌面端触发）并重载客户端。
 
-4. 启动新会话后，会话头部出现蜂巢模式开关，页面右下角出现「蜂巢任务」悬浮窗，`mission_start` / `mission_report` / `mission_status` / `mission_stop` 四个工具也在工具列表中。
+4. 启动新会话后，会话头部出现蜂巢模式开关，页面右下角出现「蜂巢任务」悬浮窗，`mission_start` / `mission_scale` / `mission_report` / `mission_status` / `mission_stop` 五个工具也在工具列表中。
 
 > 依赖 Agent Teams：本插件读取 `agentTeams`（由 `@deepseek-ai/dsh-experimental-agent-team` 提供）、`agents`、`sessions`、`tokenMeter`、`systemPrompt`、`webServer`、`workingDirectory`、`workspaceRegistry`、`sessionController` 等服务；若你的 profile 已由其他 bundle 提供同名服务，可省略上面的 profile 聚合包，但必须保证 `agentTeams` 服务可用。
 
@@ -149,7 +155,7 @@ Mission Control 让一个 Lead 会话把多个工蜂组织成一场「任务（M
 
 | 方法与路径 | 用途 |
 | --- | --- |
-| `GET /mission-dashboard-v2.json` | 驾驶舱快照：任务目标、人数上限、暂停状态、每个工蜂的状态 / token / 窗口 / 占用比例 / 工作概括，以及任务板的 pending / in_progress / completed 计数。 |
+| `GET /mission-dashboard-v2.json` | 驾驶舱快照：任务目标、`taskSet`（是否已设真实目标）、`scale`（配平统计：workers / cap / openTasks / unownedTasks / target / gap）、人数上限、暂停状态、每个工蜂的状态 / token / 窗口 / 占用比例 / 工作概括，以及任务板的 pending / in_progress / completed 计数。 |
 | `POST /mission-end-v1` | 结束任务：中断所有子会话、归档、收集结果文件、清理临时文件，并提示 Lead 汇总。请求体可选 `{ "sessionId": "...", "cleanup": true }`；不传 `sessionId` 时结束全部任务。响应含 `interrupted`、`cleanup`、`resultFiles`、`closed`、`leadNotified` 等字段。 |
 | `POST /mission-mode-v1` | 蜂巢模式开关：`{ "sessionId": "...", "enabled": true, "workers": 3 }`。开启时按需建任务或恢复暂停；关闭时暂停（子会话继续工作，广播停止）；`workers` 被钳制到 2–10。 |
 | `GET /mission-children-v1?sessionId=...` | 列出该会话下的所有子会话（id / 名称 / 状态 / 描述），供界面勾选删除。 |
@@ -175,12 +181,13 @@ mission-control/
 
 ## 使用流程
 
-1. Lead 开启会话头部的蜂巢模式开关（或调用 `mission_start`），给出任务目标与并发工蜂上限。
-2. 用 `spawn_teammate` 创建工蜂；超过上限会被拒绝。
-3. 工蜂在共享任务板上创建 / 认领任务，并随时用 `mission_report` 汇报进度。
-4. Lead 与人类可随时查看悬浮窗或调用 `mission_status`；需要让子会话安静但继续工作时，可切换为「已暂停」。
-5. 工蜂上下文将满时，哨兵自动中断并创建 `<name>-rN` 续任者，继承结构化摘要继续工作。
-6. 结束时调用 `mission_stop`，或在悬浮窗点击「结束任务」执行完整收尾（停子会话 + 归档 + 收集结果文件 + 清理临时文件），随后按提示向用户汇总并 `present` 交付物。
+1. Lead 开启会话头部的蜂巢模式开关（或调用 `mission_start`），给出任务目标与并发工蜂上限；蜂巢模式下首条人类消息也会自动记录为任务目标。
+2. Lead 把任务拆解成独立子任务建到共享任务板，按「目标 = min(子任务数, 上限)」算好人数。
+3. 用 `mission_scale` 一次性开出所需子会话（只补差额，超上限拒绝）；之后仍可逐个 `spawn_teammate`。
+4. 工蜂在共享任务板上认领任务，并随时用 `mission_report` 汇报进度。
+5. Lead 与人类可随时查看悬浮窗或调用 `mission_status`；需要让子会话安静但继续工作时，可切换为「已暂停」。
+6. 工蜂上下文将满时，哨兵自动中断并创建 `<name>-rN` 续任者，继承结构化摘要继续工作。
+7. 结束时调用 `mission_stop`，或在悬浮窗点击「结束任务」执行完整收尾（停子会话 + 归档 + 收集结果文件 + 清理临时文件），随后按提示向用户汇总并 `present` 交付物。
 
 ---
 

@@ -136,6 +136,21 @@ export function apply(ctx, rawConfig) {
     return tasksOf(agent).filter((t) => !baseline.has(t.id))
   }
 
+  /**
+   * 配平统计：根据任务板上「待认领的子任务」推算应该开几个工蜂。
+   * 目标工蜂数 = min(待办子任务数, 人数上限)；缺口 = 目标 - 现有。
+   */
+  function missionScale(mission) {
+    const tasks = missionTasks(mission)
+    const open = tasks.filter((t) => t.status === 'pending' || t.status === 'in_progress')
+    const unowned = open.filter((t) => !t.ownerName)
+    const workers = missionMembers(mission).length
+    const cap = Number(mission.cap) || 1
+    const target = Math.min(Math.max(unowned.length, open.length ? 1 : 0), cap)
+    const gap = Math.max(0, target - workers)
+    return { workers, cap, openTasks: open.length, unownedTasks: unowned.length, target, gap }
+  }
+
   /** 测量一个成员会话的上下文压力。 */
   function measureMember(member) {
     const sessions = services.sessions()
@@ -317,6 +332,8 @@ export function apply(ctx, rawConfig) {
         sessionId: mission.sessionId,
         title,
         task: mission.task,
+        taskSet: Boolean(mission.taskAt),
+        scale: missionScale(mission),
         cap: mission.cap,
         paused: mission.paused === true,
         startedAt: mission.startedAt,
@@ -472,12 +489,14 @@ export function apply(ctx, rawConfig) {
       if (existing) {
         // 重复声明 = 更新任务与上限；保留基线、暂停态与交接记录
         existing.task = String(args.task)
+        existing.taskAt = Date.now()
         existing.cap = Number(args.workers)
         existing.paused = false
       } else {
         missions.set(key, {
           sessionId: key,
           task: String(args.task),
+          taskAt: Date.now(),
           cap: Number(args.workers),
           startedAt: Date.now(),
           paused: false,
@@ -497,6 +516,122 @@ export function apply(ctx, rawConfig) {
     presentCall: (args) => ({
       card: 'generic',
       title: `Start mission (${args.workers} workers)`,
+      kind: 'other',
+      rawInput: args,
+    }),
+  })
+
+  ctx.tools.register({
+    name: 'mission_scale',
+    description:
+      'Spawn only the MISSING teammates needed for this mission, up to the worker cap. ' +
+      'Pass the workers you decided the task needs; already-existing ones are skipped, and workers ' +
+      'beyond the cap are refused. Use this instead of spawning one by one when rebalancing.',
+    parameters: {
+      type: 'object',
+      properties: {
+        workers: {
+          type: 'array',
+          description: 'Desired teammates: name + a self-contained task prompt for each.',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              name: {
+                type: 'string',
+                description: 'Unique lower-kebab-case teammate name.',
+              },
+              task: {
+                type: 'string',
+                description: 'Complete self-contained sub-task: goal, acceptance, output location.',
+              },
+            },
+            required: ['name', 'task'],
+          },
+        },
+      },
+      required: ['workers'],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          spawned: { type: 'array', items: { type: 'string' } },
+          skipped: { type: 'array', items: { type: 'string' } },
+          refused: { type: 'array', items: { type: 'string' } },
+          workers: { type: 'integer' },
+          cap: { type: 'integer' },
+        },
+        required: ['spawned', 'skipped', 'refused', 'workers', 'cap'],
+      },
+      render: (_args, value) => [
+        textBlock(
+          `Spawned ${value.spawned.length}${value.skipped.length ? `, skipped ${value.skipped.length}` : ''}` +
+            `${value.refused.length ? `, refused ${value.refused.length} (cap ${value.cap})` : ''}. ` +
+            `Now ${value.workers}/${value.cap} teammates.`,
+        ),
+      ],
+    },
+    async execute(args, exec) {
+      const agent = exec.agent
+      if (!agent) throw new Error('mission_scale requires an owning agent session')
+      const mission = missions.get(String(agent.id))
+      if (!mission) throw new Error('没有进行中的蜂巢任务，请先调用 mission_start')
+      const team = services.team()
+      if (!team) throw new Error('Agent Teams 服务不可用')
+
+      const existing = new Set(missionMembers(mission).map((m) => m.name))
+      const spawned = []
+      const skipped = []
+      const refused = []
+      const signal = new AbortController().signal
+      const requested = Array.isArray(args.workers) ? args.workers : []
+
+      for (const item of requested) {
+        const name = String(item?.name ?? '').trim()
+        const task = String(item?.task ?? '').trim()
+        if (!name || !task) {
+          refused.push(name || '(empty)')
+          continue
+        }
+        if (existing.has(name)) {
+          skipped.push(name)
+          continue
+        }
+        const current = missionMembers(mission)
+        if (current.length >= mission.cap) {
+          refused.push(name)
+          continue
+        }
+        try {
+          await team.spawnTeammate(agent, {
+            name,
+            description: task.slice(0, 60),
+            prompt: [textBlock(task)],
+            context: 'fresh',
+            provider: config.freshProvider,
+            signal,
+          })
+          existing.add(name)
+          spawned.push(name)
+        } catch (error) {
+          mission.lastError = `spawn ${name} failed: ${errText(error)}`
+          refused.push(name)
+        }
+      }
+
+      return {
+        spawned,
+        skipped,
+        refused,
+        workers: missionMembers(mission).length,
+        cap: mission.cap,
+      }
+    },
+    presentCall: (args) => ({
+      card: 'generic',
+      title: `Scale workers (${Array.isArray(args?.workers) ? args.workers.length : 0})`,
       kind: 'other',
       rawInput: args,
     }),
@@ -678,7 +813,7 @@ export function apply(ctx, rawConfig) {
     return undefined
   })
 
-  // ── 驾驶舱中继：人类发话立即扇出 ──────────────────────────────────────────
+  // ── 驾驶舱中继：人类发话立即扇出；并捕获本次任务的真实目标 ──────────────
   ctx.on('session/event', (session, event) => {
     if (event.type !== 'user/message') return
     const mission = missions.get(String(session.id))
@@ -688,28 +823,89 @@ export function apply(ctx, rawConfig) {
     if (source && source.kind !== 'user') return
     const text = blocksToText(message?.content)
     if (!text) return
+
+    // 蜂巢模式且未暂停：第一条真实任务描述写入 mission.task，作为拆解与配平依据
+    if (!mission.paused && !mission.taskAt && !text.startsWith('【蜂巢任务已结束】')) {
+      mission.task = text.slice(0, 1000)
+      mission.taskAt = Date.now()
+    }
+
     broadcast(mission, text)
   })
 
-  // ── 提示词引导：让工蜂主动上报工作概括（无任务时不注入任何内容）────────────
+  // ── 提示词：蜂巢模式的分派契约 + 工蜂汇报 ──────────────────────────────
   {
     const sysPrompt = ctx.get('systemPrompt')
+    const scopeAgent = () => {
+      try {
+        return ctx.get('agents')?.currentInitiator?.()
+      } catch {
+        return undefined
+      }
+    }
+    const missionFor = () => {
+      const agent = scopeAgent()
+      return agent ? missions.get(String(agent.id)) : undefined
+    }
     if (sysPrompt && typeof sysPrompt.section === 'function') {
       try {
         sysPrompt.section({
-          name: 'mission-control:reporting',
-          order: 950,
-          text: () =>
-            missions.size === 0
-              ? ''
-              : [
-                  '## 蜂巢任务工作汇报',
-                  '你属于一个蜂巢任务团队。驾驶舱面板会实时显示每个成员的工作概括，',
-                  '所以请在「开始做一件事」和「做完一件事」时调用 `mission_report`：',
-                  '- `current`：你此刻在做的事，一句短中文（≤30 字），例如「优化界面显示」。',
-                  '- `completed`：你刚完成的事，一句短中文，例如「构建协作插件框架」。',
-                  '保持简短、说人话，不要粘贴日志或英文原文。',
-                ].join('\n'),
+          name: 'mission-control:hive',
+          order: 945,
+          text: () => {
+            if (missions.size === 0) return ''
+            const agent = scopeAgent()
+            const mission = agent ? missions.get(String(agent.id)) : undefined
+
+            // 子会话（teammate）身份：只做分配给自己的事 + 汇报
+            if (!mission) {
+              const team = services.team()
+              let role
+              try {
+                role = agent ? team?.membership?.(agent)?.role : undefined
+              } catch {
+                role = undefined
+              }
+              if (role !== 'teammate') return ''
+              return [
+                '## 蜂巢任务：你是子会话',
+                '你只负责完成分配给自己的子任务；需要协作时用 `send_message`，',
+                '并在「开始做一件事」和「做完一件事」时调用 `mission_report`：',
+                '- `current`：你此刻在做的事，一句短中文（≤30 字），例如「优化界面显示」。',
+                '- `completed`：你刚完成的事，一句短中文，例如「构建协作插件框架」。',
+              ].join('\n')
+            }
+
+            const stats = missionScale(mission)
+            if (stats.gap > 0 && mission.taskAt) {
+              // 已收到任务但工蜂不足：催办补开
+              return [
+                '## 蜂巢任务：必须补开子会话',
+                `你已收到任务，但当前只有 ${stats.workers} 个子会话，按拆解结果需要 ${stats.target} 个（上限 ${stats.cap}）。`,
+                `**现在必须再开 ${stats.gap} 个子会话**（调用 \`mission_scale\`，或逐个 \`spawn_teammate\`），`,
+                '然后才继续协调。不要自己把剩余工作做完。',
+              ].join('\n')
+            }
+
+            return [
+              '## 蜂巢任务：你是主会话（Lead）',
+              `当前人数上限：${stats.cap}；现有子会话：${stats.workers}；任务板待办：${stats.openTasks}。`,
+              '',
+              '收到任务后按以下顺序执行，**不得跳过**：',
+              '1. 调用 `mission_start(task, workers)` 记录本次任务目标与人数上限；',
+              '2. 把任务拆解成**若干独立子任务**，用 `team_task_create` 逐个建到共享任务板；',
+              '3. 计算需要几个子会话：**目标 = min(子任务数, 人数上限)**，不超过上限；',
+              '4. 用 `mission_scale` 一次性开出差额子会话（已有不足时它只补差额）；',
+              '   每个子会话都必须拿到自包含的提示：具体子任务、验收标准、产出位置；',
+              '5. **你自己只做协调、验收与汇总**，不要把主任务自己做掉；',
+              '6. 子任务完成、任务板全部 completed 后，再输出最终汇总。',
+              '',
+              '判定规则：',
+              '- 还没有任何子会话 → 拆解后开 min(子任务数, 上限) 个；',
+              '- 已有子会话但少于目标 → **只补开差额**，不要重复开；',
+              '- 子会话汇报完成 → 用 `mission_report` 之外的方式验收文件/结果。',
+            ].join('\n')
+          },
         })
       } catch {
         // 该 profile 没有 systemPrompt 服务时静默跳过

@@ -596,6 +596,10 @@ window.__ModuleLoader__.load({
       }
       const pct = total > 0 ? Math.round((completed / total) * 100) : 0;
       const paused = missions.some((m) => m.paused === true);
+      const scale = mission.scale || null;
+      const workerLabel = scale
+        ? `${scale.workers}/${scale.cap} 工蜂${scale.openTasks ? ` · 待办 ${scale.openTasks}` : ''}${scale.gap > 0 ? ` · 建议再开 ${scale.gap}` : ''}`
+        : `${mateCount} 工蜂`;
 
       const toggle = () => {
         setOpen((v) => {
@@ -722,7 +726,7 @@ window.__ModuleLoader__.load({
         h('span', { style: s.dot(runningCount > 0 ? T.brand : T.success) }),
         h('span', { style: { ...s.title, maxWidth: 150, overflow: 'hidden', textOverflow: 'ellipsis' }, title: mission.title || '' },
           mission.title || '蜂巢任务'),
-        h('span', { style: s.meta }, `${mateCount} 工蜂${runningCount ? ` · ${runningCount} 工作中` : ' · 全部空闲'}${paused ? ' · 已暂停' : ''}`),
+        h('span', { style: s.meta }, `${workerLabel}${runningCount ? ` · ${runningCount} 工作中` : ''}${paused ? ' · 已暂停' : ''}`),
         open ? h('span', { style: s.bar }, h('span', { style: s.barFill(pct, T.success) })) : null,
         open ? h('span', { style: s.meta }, `${pct}%`) : null,
         open ? h('button', {
