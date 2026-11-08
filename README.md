@@ -4,6 +4,8 @@
 
 Mission Control 让一个 Lead 会话把多个工蜂组织成一场「任务（Mission）」：会话头部一键开启蜂巢模式并锁定人数上限，运行中持续测量每个工蜂的上下文压力并在将满时自动换人续接，人类在会话里说的话立即扇出给全体成员，所有进度集中显示在每个主会话独立、可拖动、可折叠的悬浮窗里；结束时自动收集结果文件、归档子会话并提示 Lead 汇总。所有检测都在 Host 侧完成，不消耗任何会话的模型 token。
 
+> **第一次用？** 直接看 [快速入门（docs/QUICKSTART.md）](./docs/QUICKSTART.md)：5 分钟跑通一次完整蜂巢任务。
+
 ---
 
 ## 功能特性
@@ -200,6 +202,8 @@ mission-control/
 ├── locale/
 │   ├── en.json         # 英文标题与描述
 │   └── zh.json         # 中文标题与描述
+├── docs/
+│   └── QUICKSTART.md   # 快速入门：5 分钟跑通一次蜂巢任务
 ├── icon.svg            # 插件图标
 └── package.json        # 包元数据（含 peerDependencies 强依赖声明）与 dsh.bundle / dsh.client 声明
 ```
@@ -208,6 +212,7 @@ mission-control/
 
 ## 使用流程
 
+> 首次使用建议先读 [快速入门](./docs/QUICKSTART.md)，下面是完整流程的概览。
 1. Lead 开启会话头部的蜂巢模式开关（或调用 `mission_start`），给出任务目标与并发工蜂上限；蜂巢模式下首条人类消息也会自动记录为任务目标。
 2. Lead 把任务拆解成独立子任务建到共享任务板，按「目标 = min(子任务数, 上限)」算好人数。
 3. 用 `mission_scale` 一次性开出所需子会话（只补差额，超上限拒绝）；之后仍可逐个 `spawn_teammate`。

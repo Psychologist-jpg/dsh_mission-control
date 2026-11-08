@@ -1,6 +1,6 @@
 {
   "name": "@local/mission-control",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "private": true,
   "type": "module",
   "description": "Mission console for Agent Teams: per-mission teammate cap, token sentinel with automatic handoff, instant relay of console messages, and a real-time progress dashboard.",
