@@ -10,9 +10,9 @@
  * 所有检测都在 Host 侧完成，不消耗任何会话的 token。
  */
 
-import { readdir, unlink, rm } from 'node:fs/promises'
+import { readdir, unlink, rm, mkdir, writeFile } from 'node:fs/promises'
 import { existsSync, statSync, readdirSync, readFileSync } from 'node:fs'
-import { join, resolve, sep } from 'node:path'
+import { join, resolve, sep, dirname } from 'node:path'
 
 const DEFAULT_CONFIG = {
   pollIntervalMs: 15000,
@@ -40,6 +40,26 @@ const DEFAULT_CONFIG = {
   cleanupMaxFiles: 500,
   // 结束时是否物理删除子会话的日志文件（默认关闭：仅归档，不删记录）
   deleteSessionLogs: false,
+  // 生图：任务命中关键词时不再切换会话模型（图像模型不支持 chat 协议，会 404），
+  // 改为让子会话调用 mission_image 工具，用配置的图像模型真正出图。
+  imageModelSwitch: false,
+  imageProvider: 'ustc',
+  imageModel: 'qwen-image-2.1',
+  imageApiBaseUrl: 'https://api.llm.ustc.edu.cn/v1',
+  imageApiKeyRef: 'USTC_API_KEY',
+  imageApiSize: '1024x1024',
+  imageKeywords: [
+    '生图', '生成图片', '画图', '绘制', '插图', '配图', '出图',
+    '海报', '封面图', '示意图', '图片生成', '文生图',
+    'image', 'draw', 'illustration', 'poster',
+  ],
+}
+
+/** 任务文本是否属于"需要生图"的范畴。 */
+function needsImageModel(text, keywords) {
+  const source = String(text ?? '').toLowerCase()
+  if (!source) return false
+  return (keywords ?? []).some((kw) => kw && source.includes(String(kw).toLowerCase()))
 }
 
 /** 把一个 glob（仅支持 * 和 ?）编译成正则。 */
@@ -118,6 +138,101 @@ export function apply(ctx, rawConfig) {
     } catch {
       return []
     }
+  }
+
+  /** 切换某个子会话的模型：优先用 agent.model.select()（平台要求在 step 准备前）。 */
+  async function switchMemberModel(mission, agent, name, provider, model) {
+    const member = teammatesOf(agent).find((m) => String(m.name) === String(name))
+    if (!member) return { ok: false, error: `找不到成员 ${name}` }
+    const target = services.agents()?.get(String(member.id))
+    if (!target) return { ok: false, error: `成员 ${name} 不在线` }
+
+    const selection = { provider, model }
+    try {
+      if (target.model && typeof target.model.select === 'function') {
+        await target.model.select(selection)
+      } else if (typeof target.selectModel === 'function') {
+        await target.selectModel(selection)
+      } else {
+        return { ok: false, error: '当前平台没有 agent.model.select()，无法为子会话切换模型' }
+      }
+    } catch (error) {
+      return { ok: false, error: errText(error) }
+    }
+
+    mission.workerModels = mission.workerModels ?? new Map()
+    mission.workerModels.set(String(name), selection)
+    return { ok: true, selected: `${provider}/${model}` }
+  }
+
+  /** 按任务文本决定该工蜂的模型：命中生图关键词 → imageModel，否则默认模型。 */
+  async function applyModelPolicy(mission, agent, name, taskText, explicit) {
+    if (config.imageModelSwitch !== true) return { applied: false, reason: 'disabled' }
+    const wantsImage = explicit?.image === true
+      || (explicit?.image !== false && needsImageModel(taskText, config.imageKeywords))
+    if (!wantsImage) return { applied: false, reason: 'default-model' }
+    const provider = explicit?.provider || config.imageProvider
+    const model = explicit?.model || config.imageModel
+    if (!provider || !model) return { applied: false, reason: 'no-image-model-configured' }
+    const result = await switchMemberModel(mission, agent, name, provider, model)
+    return { applied: result.ok, reason: result.ok ? 'image-model' : result.error, model: result.selected }
+  }
+
+  /** 解析图像模型的 API key：DSH 凭据库优先，其次进程环境变量。 */
+  async function resolveImageApiKey() {
+    const name = String(config.imageApiKeyRef || 'USTC_API_KEY')
+    try {
+      const credentials = ctx.get('credentials')
+      if (credentials && typeof credentials.resolve === 'function') {
+        const resolved = await credentials.resolve(name)
+        if (resolved && resolved.value) return resolved.value
+      }
+    } catch {
+      // 凭据服务不可用时回退环境变量
+    }
+    return process.env[name] ?? ''
+  }
+
+  /** 调用图像模型生成图片并落盘，返回文件路径。 */
+  async function generateImage(agent, options) {
+    const prompt = String(options?.prompt ?? '').trim()
+    if (!prompt) throw new Error('prompt 不能为空')
+    const apiKey = await resolveImageApiKey()
+    if (!apiKey) throw new Error(`未找到图像模型凭据（${config.imageApiKeyRef}）`)
+
+    const base = String(config.imageApiBaseUrl || '').replace(/\/+$/, '')
+    const size = String(options?.size || config.imageApiSize || '1024x1024')
+    const response = await fetch(`${base}/images/generations`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: String(options?.model || config.imageModel),
+        prompt,
+        n: 1,
+        size,
+        response_format: 'b64_json',
+      }),
+    })
+    if (!response.ok) {
+      const text = await response.text().catch(() => '')
+      throw new Error(`图像接口 ${response.status}: ${text.slice(0, 300)}`)
+    }
+    const payload = await response.json()
+    const b64 = payload?.data?.[0]?.b64_json
+    if (!b64) throw new Error('图像接口未返回 b64_json')
+
+    const root = workspaceOf(agent)
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+    const relative = String(options?.path || `images/${stamp}.png`).replace(/^[\\/]+/, '')
+    const target = resolve(root, relative)
+    if (!target.startsWith(resolve(root) + sep)) throw new Error('输出路径必须位于工作目录内')
+    await mkdir(dirname(target), { recursive: true })
+    const bytes = Buffer.from(b64, 'base64')
+    await writeFile(target, bytes)
+    return { path: target, bytes: bytes.length, model: String(options?.model || config.imageModel) }
   }
 
   /**
@@ -241,6 +356,7 @@ export function apply(ctx, rawConfig) {
     let turns = 0
     let toolCalls = 0
     let lastAction = ''
+    let actualModel = ''
     const files = []
 
     if (session) {
@@ -264,6 +380,10 @@ export function apply(ctx, rawConfig) {
         }
         for (let i = events.length - 1; i >= 0; i -= 1) {
           if (events[i].type !== 'assistant/message') continue
+          const source = events[i].data?.message?.source
+          if (source && source.provider && !actualModel) {
+            actualModel = `${source.provider}/${source.model}`
+          }
           const text = blocksToText(events[i].data?.message?.content)
           if (text) {
             lastAction = text
@@ -305,6 +425,7 @@ export function apply(ctx, rawConfig) {
       currentSummary,
       completedSummary,
       lastAction: deriveShort(lastAction),
+      actualModel,
       files: files.slice(-5),
       turns,
       toolCalls,
@@ -341,6 +462,10 @@ export function apply(ctx, rawConfig) {
           tokens: usage.tokens,
           contextWindow: usage.window,
           ratio: Math.round(usage.ratio * 1000) / 1000,
+          model: (() => {
+            const entry = mission.workerModels?.get(String(member.name))
+            return entry ? `${entry.provider}/${entry.model}` : ''
+          })(),
           ...workDetail(member, tasks),
         }
       })
@@ -566,6 +691,20 @@ export function apply(ctx, rawConfig) {
                 type: 'string',
                 description: 'Complete self-contained sub-task: goal, acceptance, output location.',
               },
+              image: {
+                type: 'boolean',
+                description:
+                  'Set true when this sub-task must GENERATE images; the worker then switches to the ' +
+                  'configured image model. Omit to let keyword detection decide, false to force the default model.',
+              },
+              provider: {
+                type: 'string',
+                description: 'Optional model provider override for this worker (only with an image task).',
+              },
+              model: {
+                type: 'string',
+                description: 'Optional model override for this worker (only with an image task).',
+              },
             },
             required: ['name', 'task'],
           },
@@ -581,16 +720,20 @@ export function apply(ctx, rawConfig) {
           spawned: { type: 'array', items: { type: 'string' } },
           skipped: { type: 'array', items: { type: 'string' } },
           refused: { type: 'array', items: { type: 'string' } },
+          modelSwitches: { type: 'array', items: { type: 'string' } },
+          modelErrors: { type: 'array', items: { type: 'string' } },
           workers: { type: 'integer' },
           cap: { type: 'integer' },
         },
-        required: ['spawned', 'skipped', 'refused', 'workers', 'cap'],
+        required: ['spawned', 'skipped', 'refused', 'modelSwitches', 'modelErrors', 'workers', 'cap'],
       },
       render: (_args, value) => [
         textBlock(
           `Spawned ${value.spawned.length}${value.skipped.length ? `, skipped ${value.skipped.length}` : ''}` +
             `${value.refused.length ? `, refused ${value.refused.length} (cap ${value.cap})` : ''}. ` +
-            `Now ${value.workers}/${value.cap} teammates.`,
+            `Now ${value.workers}/${value.cap} teammates.` +
+            (value.modelSwitches.length ? ` Image model switched: ${value.modelSwitches.join(', ')}.` : '') +
+            (value.modelErrors.length ? ` Model switch failed: ${value.modelErrors.join('; ')}.` : ''),
         ),
       ],
     },
@@ -606,6 +749,8 @@ export function apply(ctx, rawConfig) {
       const spawned = []
       const skipped = []
       const refused = []
+      const modelSwitches = []
+      const modelErrors = []
       // 花名册里所有用过的名字（含已删除/已归档）都不能复用，冲突时自动加后缀
       const rosterNames = new Set(teammatesOf(agent).map((m) => String(m.name)))
       const uniqueName = (base) => {
@@ -652,6 +797,16 @@ export function apply(ctx, rawConfig) {
           existing.add(name)
           rosterNames.add(name)
           spawned.push(name)
+          // 生图任务 → 切换到图像模型；其余保持默认模型
+          const policy = await applyModelPolicy(mission, agent, name, task, {
+            image: item?.image,
+            provider: item?.provider,
+            model: item?.model,
+          })
+          if (policy.applied && policy.model) modelSwitches.push(`${name}→${policy.model}`)
+          else if (!policy.applied && policy.reason && policy.reason !== 'default-model' && policy.reason !== 'disabled') {
+            modelErrors.push(`${name}: ${policy.reason}`)
+          }
         } catch (error) {
           mission.lastError = `spawn ${name} failed: ${errText(error)}`
           refused.push(rawName)
@@ -662,6 +817,8 @@ export function apply(ctx, rawConfig) {
         spawned,
         skipped,
         refused,
+        modelSwitches,
+        modelErrors,
         workers: missionMembers(mission).length,
         cap: mission.cap,
       }
@@ -669,6 +826,126 @@ export function apply(ctx, rawConfig) {
     presentCall: (args) => ({
       card: 'generic',
       title: `Scale workers (${Array.isArray(args?.workers) ? args.workers.length : 0})`,
+      kind: 'other',
+      rawInput: args,
+    }),
+  })
+
+  ctx.tools.register({
+    name: 'mission_set_model',
+    description:
+      'Switch one existing teammate to another model (for example the image model) after it was spawned. ' +
+      'Use it when a worker turns out to need image generation, or to move a worker back to the default model.',
+    parameters: {
+      type: 'object',
+      properties: {
+        name: {
+          type: 'string',
+          description: 'Existing teammate name.',
+        },
+        provider: {
+          type: 'string',
+          description: 'Model provider id, e.g. "ustc". Omit to use the configured image provider.',
+        },
+        model: {
+          type: 'string',
+          description: 'Model id, e.g. "qwen-image-2.1". Omit to use the configured image model.',
+        },
+        revert: {
+          type: 'boolean',
+          description: 'Set true to switch this worker back to the session default model.',
+        },
+      },
+      required: ['name'],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ok: { type: 'boolean' },
+          model: { type: 'string' },
+          error: { type: 'string' },
+        },
+        required: ['ok'],
+      },
+      render: (_args, value) =>
+        [textBlock(value.ok ? `Model now ${value.model}.` : `Model switch failed: ${value.error ?? 'unknown'}`)],
+    },
+    async execute(args, exec) {
+      const agent = exec.agent
+      if (!agent) throw new Error('mission_set_model requires an owning agent session')
+      const mission = missions.get(String(agent.id))
+      if (!mission) throw new Error('没有进行中的蜂巢任务，请先调用 mission_start')
+      if (args.revert === true) {
+        mission.workerModels?.delete(String(args.name))
+        return { ok: true, model: 'default' }
+      }
+      const provider = String(args.provider ?? config.imageProvider ?? '').trim()
+      const model = String(args.model ?? config.imageModel ?? '').trim()
+      if (!provider || !model) return { ok: false, error: '未配置图像模型（provider/model）' }
+      const result = await switchMemberModel(mission, agent, args.name, provider, model)
+      return result.ok
+        ? { ok: true, model: result.selected }
+        : { ok: false, error: result.error }
+    },
+    presentCall: (args) => ({
+      card: 'generic',
+      title: `Switch model: ${args?.name ?? ''}`,
+      kind: 'other',
+      rawInput: args,
+    }),
+  })
+
+  ctx.tools.register({
+    name: 'mission_image',
+    description:
+      'Generate an image with the configured image model (' +
+      String(DEFAULT_CONFIG.imageModel) +
+      ') and save it into the workspace. Use this instead of switching your own chat model: image models ' +
+      'cannot serve normal conversation requests.',
+    parameters: {
+      type: 'object',
+      properties: {
+        prompt: {
+          type: 'string',
+          description: 'Detailed image description (subject, style, colors, composition).',
+        },
+        path: {
+          type: 'string',
+          description: 'Output path relative to the workspace, e.g. "images/cover.png". Defaults to a timestamped PNG.',
+        },
+        size: {
+          type: 'string',
+          description: 'Requested size, e.g. "1024x1024". Defaults to the plugin config.',
+        },
+        model: {
+          type: 'string',
+          description: 'Optional image model override. Defaults to the configured image model.',
+        },
+      },
+      required: ['prompt'],
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          path: { type: 'string' },
+          bytes: { type: 'integer' },
+          model: { type: 'string' },
+        },
+        required: ['path', 'bytes', 'model'],
+      },
+      render: (_args, value) => [textBlock(`Image saved: ${value.path} (${value.bytes} bytes, ${value.model})`)],
+    },
+    async execute(args, exec) {
+      const result = await generateImage(exec.agent, args)
+      return result
+    },
+    presentCall: (args) => ({
+      card: 'generic',
+      title: 'Generate image',
       kind: 'other',
       rawInput: args,
     }),
@@ -910,6 +1187,9 @@ export function apply(ctx, rawConfig) {
                 '并在「开始做一件事」和「做完一件事」时调用 `mission_report`：',
                 '- `current`：你此刻在做的事，一句短中文（≤30 字），例如「优化界面显示」。',
                 '- `completed`：你刚完成的事，一句短中文，例如「构建协作插件框架」。',
+                '',
+                '**需要生成图片时**：不要切换自己的对话模型（图像模型不能用于对话），',
+                '直接调用 `mission_image` 工具出图并保存到工作区。',
               ].join('\n')
             }
 

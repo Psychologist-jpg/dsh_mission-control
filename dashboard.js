@@ -175,6 +175,9 @@ window.__ModuleLoader__.load({
         files.length > 0
           ? h('div', { style: s.sub, title: files.join('\n') }, `产出文件：${files.join('、')}`)
           : null,
+        member.model || member.actualModel
+          ? h('div', { style: s.sub }, `模型：${member.actualModel || member.model}`)
+          : null,
       );
     }
 

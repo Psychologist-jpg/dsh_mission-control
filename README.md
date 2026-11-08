@@ -8,12 +8,14 @@ Mission Control 让一个 Lead 会话把多个工蜂组织成一场「任务（M
 
 ## 功能特性
 
-### 五个工具
+### 七个工具
 
 | 工具 | 作用 |
 | --- | --- |
 | `mission_start` | 在本会话声明一个任务，记录任务目标与并发工蜂上限 `workers`；之后才允许创建工蜂，超出上限的创建请求会被直接拒绝。重复调用可更新任务目标与上限。 |
-| `mission_scale` | 按需**只补差额**地开子会话：传入期望的子会话清单（名称 + 自包含子任务），已存在的跳过、超出上限的拒绝，一次调用完成配平，避免逐个 spawn。 |
+| `mission_scale` | 按需**只补差额**地开子会话：传入期望的子会话清单（名称 + 自包含子任务，可选 `image` / `provider` / `model`），已存在的跳过、超出上限的拒绝，一次调用完成配平；生图子任务会顺带切到图像模型。 |
+| `mission_set_model` | 把已存在的某个工蜂切换到另一个模型（通常是图像模型），或 `revert: true` 切回会话默认模型。 |
+| `mission_image` | 用配置的图像模型真正出图并落盘到工作区（`prompt` / `path` / `size` / `model`），返回路径与字节数。**图像模型不能承担普通对话请求**，所以出图必须走这个工具，而不是切换对话模型。 |
 | `mission_report` | 工蜂自报工作概括：`current`（此刻在做什么）与 `completed`（刚做完什么），每行一句短中文，驾驶舱面板据此显示人话进度。 |
 | `mission_status` | 只读地读取任务实时状态：每个工蜂的运行状态、上下文 token 占窗口比例、当前承担的任务。 |
 | `mission_stop` | 结束本会话上的任务：清除人数上限并停止上下文哨兵。 |
@@ -48,14 +50,21 @@ Mission Control 让一个 Lead 会话把多个工蜂组织成一场「任务（M
      - **彻底删除**：停止 → 解除归档 → 删除磁盘上的会话日志目录与投影缓存（不可恢复），已删除条目变灰不可再选。
    - 花名册里会长期残留历史条目（平台无移除成员 API），因此「广播 / 结束归档 / 计数」都会先经 `liveMembers()` 过滤；`mission_scale` 生成的名字也会对**整份花名册**（含历史条目）去重，冲突时自动加 `-2`、`-3` 后缀。
 
-6. **实时进度悬浮窗（Dashboard）**
+6. **生图模型策略（Image Model Policy）**
+   图像模型不支持 chat 协议（直接切会话模型会 404），因此插件把「生图」做成工具能力而非模型切换：
+   - `mission_image` 直接调用配置的图像接口（默认 `qwen-image-2.1`，OpenAI 兼容 `/images/generations`，`response_format: b64_json`），把图片落盘到工作区，路径限制在工作目录内；
+   - API key 优先从 DSH 凭据库取（`imageApiKeyRef`），取不到再回退同名环境变量；
+   - `mission_scale` 支持按子任务文本命中生图关键词（`imageKeywords`）或显式 `image: true` 自动切到图像模型，也可用 `provider` / `model` 覆盖；`mission_set_model` 可事后切换或 `revert` 回默认；
+   - 该自动切换受 `imageModelSwitch` 开关控制，**默认关闭**（守住「图像模型不能对话」这条线，只提供 `mission_image` 工具）。
+
+7. **实时进度悬浮窗（Dashboard）**
    `dashboard.js` 在 Web 客户端注入悬浮层（`shell.overlay`），每 2 秒轮询 `/mission-dashboard-v2.json`，**每个主会话渲染一个独立悬浮窗**：
    - 可拖动、可折叠，位置与折叠状态按会话分别保存在 `localStorage`，多窗口默认错开不重叠；
    - 标题显示会话标题（来自 `sessionTitle` 服务，取不到则回退「会话 <id 尾号>」）；
-   - 显示配平统计（现有/上限工蜂、待办数、建议再开数）、工蜂状态徽标、上下文占用进度条（绿 → 黄 → 红）、当前任务、已完成任务、产出文件、暂停状态；
+   - 显示配平统计（现有/上限工蜂、待办数、建议再开数）、工蜂状态徽标、上下文占用进度条（绿 → 黄 → 红）、当前任务、已完成任务、产出文件、**当前模型**（优先取实际使用的模型，其次策略指定值）、暂停状态；
    - 「结束任务」按钮会先确认，再 `POST /mission-end-v1` 执行完整收尾；结束后弹出可拖动、可关闭的结束提示卡片，15 秒后自动消失。
 
-   另外，任务进行中会通过 `systemPrompt.section` 注入「分派契约 / 催办 / 汇报」三段式提示（见上文「任务拆解与人数配平」）；没有任务时不注入任何内容。
+   另外，任务进行中会通过 `systemPrompt.section` 注入「分派契约 / 催办 / 汇报」三段式提示（见上文「任务拆解与人数配平」），并提示子会话「需要生图时调用 `mission_image`，不要切换自己的对话模型」；没有任务时不注入任何内容。
 
 ### 结束任务（完整收尾）
 
@@ -135,6 +144,13 @@ Mission Control 让一个 Lead 会话把多个工蜂组织成一场「任务（M
 | `cleanupGlobs` | `*.tmp`、`*.temp`、`*.log`、`*.bak`、`*.orig`、`*.rej`、`*.swp`、`*.swo`、`*~`、`.DS_Store`、`Thumbs.db` | 「结束任务」时删除的临时文件模式（仅按文件名匹配）。 |
 | `cleanupDirs` | `[".mission-control/tmp"]` | 「结束任务」时整个删除的临时目录（相对工作目录）。 |
 | `cleanupMaxFiles` | `500` | 单次清理删除文件数的上限。 |
+| `imageModelSwitch` | `false` | 是否允许按生图关键词自动把子会话切到图像模型（默认关闭，仅提供 `mission_image` 工具）。 |
+| `imageProvider` | `"ustc"` | 图像模型 provider id。 |
+| `imageModel` | `"qwen-image-2.1"` | 图像模型 id。 |
+| `imageApiBaseUrl` | `"https://api.llm.ustc.edu.cn/v1"` | 图像接口基址（OpenAI 兼容 `/images/generations`）。 |
+| `imageApiKeyRef` | `"USTC_API_KEY"` | 图像接口密钥名：优先取 DSH 凭据库，其次同名环境变量。 |
+| `imageApiSize` | `"1024x1024"` | `mission_image` 默认出图尺寸。 |
+| `imageKeywords` | `生图`、`生成图片`、`画图`、`绘制`、`插图`、`配图`、`出图`、`海报`、`封面图`、`示意图`、`图片生成`、`文生图`、`image`、`draw`、`illustration`、`poster` | 判定「需要生图」的关键词（大小写不敏感）。 |
 
 示例：
 
@@ -149,6 +165,12 @@ Mission Control 让一个 Lead 会话把多个工蜂组织成一场「任务（M
         defaultCap: 3
         freshProvider: spawn
         deleteSessionLogs: false
+        imageModelSwitch: false
+        imageProvider: ustc
+        imageModel: qwen-image-2.1
+        imageApiBaseUrl: https://api.llm.ustc.edu.cn/v1
+        imageApiKeyRef: USTC_API_KEY
+        imageApiSize: 1024x1024
 ```
 
 ---
@@ -159,7 +181,7 @@ Mission Control 让一个 Lead 会话把多个工蜂组织成一场「任务（M
 
 | 方法与路径 | 用途 |
 | --- | --- |
-| `GET /mission-dashboard-v2.json` | 驾驶舱快照：任务目标、`taskSet`（是否已设真实目标）、`scale`（配平统计：workers / cap / openTasks / unownedTasks / target / gap）、人数上限、暂停状态、每个工蜂的状态 / token / 窗口 / 占用比例 / 工作概括，以及任务板的 pending / in_progress / completed 计数。 |
+| `GET /mission-dashboard-v2.json` | 驾驶舱快照：任务目标、`taskSet`（是否已设真实目标）、`scale`（配平统计：workers / cap / openTasks / unownedTasks / target / gap）、人数上限、暂停状态、每个工蜂的状态 / token / 窗口 / 占用比例 / **模型**（`model` 为策略指定值，`actualModel` 从会话事件里读到的实际使用模型）/ 工作概括，以及任务板的 pending / in_progress / completed 计数。 |
 | `POST /mission-end-v1` | 结束任务：中断所有存活子会话、归档、清理孤儿归档、收集结果文件、清理临时文件，并提示 Lead 汇总。请求体可选 `{ "sessionId": "...", "cleanup": true }`；不传 `sessionId` 时结束全部任务。响应含 `interrupted`、`cleanup`、`resultFiles`、`closed`、`leadNotified`、`archivePruned` 等字段。 |
 | `POST /mission-mode-v1` | 蜂巢模式开关：`{ "sessionId": "...", "enabled": true, "workers": 3 }`。开启时按需建任务或恢复暂停；关闭时暂停（子会话继续工作，广播停止）；`workers` 被钳制到 2–10。 |
 | `GET /mission-children-v1?sessionId=...` | 列出该会话下的所有子会话（id / 名称 / 状态 / 描述），并按普通 → 归档 → 已删除排序；每条带 `archived`（是否已归档）与 `exists`（磁盘上是否还有会话目录）。可选 `includeArchived=1`、`includeDeleted=1`。响应另含 `total`、`activeCount`、`archivedCount`、`deletedCount`。 |
@@ -172,7 +194,7 @@ Mission Control 让一个 Lead 会话把多个工蜂组织成一场「任务（M
 
 ```text
 mission-control/
-├── index.js            # Host 侧插件：工具注册、人数守卫、上下文哨兵、广播、蜂巢模式、HTTP 路由、结果收集与清理
+├── index.js            # Host 侧插件：工具注册、人数守卫、上下文哨兵、广播、蜂巢模式、模型策略、HTTP 路由、结果收集与清理
 ├── dashboard.js        # Web 客户端：会话头部蜂巢开关 + 子会话管理弹窗 + 悬浮窗（DSH ModuleLoader + React）
 ├── cordis.patch.yml    # 插件 bundle patch（插入插件并给出默认配置）
 ├── locale/
@@ -189,7 +211,7 @@ mission-control/
 1. Lead 开启会话头部的蜂巢模式开关（或调用 `mission_start`），给出任务目标与并发工蜂上限；蜂巢模式下首条人类消息也会自动记录为任务目标。
 2. Lead 把任务拆解成独立子任务建到共享任务板，按「目标 = min(子任务数, 上限)」算好人数。
 3. 用 `mission_scale` 一次性开出所需子会话（只补差额，超上限拒绝）；之后仍可逐个 `spawn_teammate`。
-4. 工蜂在共享任务板上认领任务，并随时用 `mission_report` 汇报进度。
+4. 工蜂在共享任务板上认领任务，并随时用 `mission_report` 汇报进度；需要生成图片时调用 `mission_image` 出图（不要切换自己的对话模型）。
 5. Lead 与人类可随时查看悬浮窗或调用 `mission_status`；需要让子会话安静但继续工作时，可切换为「已暂停」。
 6. 工蜂上下文将满时，哨兵自动中断并创建 `<name>-rN` 续任者，继承结构化摘要继续工作。
 7. 结束时调用 `mission_stop`，或在悬浮窗点击「结束任务」执行完整收尾（停子会话 + 归档 + 收集结果文件 + 清理临时文件），随后按提示向用户汇总并 `present` 交付物。
@@ -203,9 +225,12 @@ mission-control/
 - **日志删除默认关闭**：`deleteSessionLogs` 默认 `false`，结束任务时只归档、不删日志；如需在收尾时物理删除，显式设为 `true`（子会话管理弹窗里的「彻底删除」不受此开关影响）。
 - **历史条目不会自动消失**：平台没有移除成员的 API，花名册会长期保留已删除/已归档的子会话名；插件已在广播、结束归档、计数、命名去重处过滤/规避这些条目。
 - **暂停语义**：暂停只停止「主会话 → 子会话」的消息下发，子会话本身继续运行，哨兵仍会监控并交接。
+- **图像模型不能对话**：切换到图像模型的会话只适合出图，不能承担普通对话请求（会 404）。默认 `imageModelSwitch: false`，生图统一走 `mission_image`；确需自动切换时再开启。
+- **生图凭据与出图范围**：`mission_image` 需要 `imageApiKeyRef` 指向的密钥（DSH 凭据库或同名环境变量），未配置会直接报错；输出路径被限制在工作目录内，越界会被拒绝。
 - **续任者命名**：交接产生的续任者形如 `team-name-r1`、`team-name-r2`，任务板上原有的归属不会自动迁移，续任者需自行认领未完成任务。
 - **界面文案**：悬浮窗与开关目前以中文展示状态与字段。
 - **读取本地存储**：为识别归档与已删除会话，插件会读取 `$DSH_HOME/storages/workspace.json` 的归档集合，并扫描 `$DSH_HOME/sessions/` 下的会话目录（只读目录名，不读会话内容）。
+- **网络请求**：除 `mission_image` 会向配置的图像接口发起 HTTPS 请求外，插件不发起任何外部网络调用；出图时会把 prompt 发送给该接口。
 - **隐私**：插件只读取 Host 侧会话元数据（事件类型、token 计数、任务板内容、工具调用参数中的路径），不会把会话正文发送到外部。
 
 ---
