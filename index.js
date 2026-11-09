@@ -112,6 +112,11 @@ export function apply(ctx, rawConfig) {
   const config = { ...DEFAULT_CONFIG, ...(rawConfig ?? {}) }
   /** sessionId(string) -> mission */
   const missions = new Map()
+  /**
+   * 曾经开过蜂巢模式、但现在已经关闭/结束的会话。
+   * 系统提示据此补一条"回到普通会话"的指令，压掉对话历史里残留的旧分派契约。
+   */
+  const hiveOffNotice = new Set()
 
   const services = {
     team: () => ctx.get('agentTeams'),
@@ -1106,6 +1111,7 @@ export function apply(ctx, rawConfig) {
       const agent = exec.agent
       if (!agent) throw new Error('mission_stop requires an owning agent session')
       missions.delete(String(agent.id))
+      hiveOffNotice.add(String(agent.id))
       return Promise.resolve({ ok: true })
     },
     presentCall: () => ({ card: 'generic', title: 'Stop mission', kind: 'other' }),
@@ -1157,9 +1163,10 @@ export function apply(ctx, rawConfig) {
         return undefined
       }
     }
-    const missionFor = () => {
-      const agent = scopeAgent()
-      return agent ? missions.get(String(agent.id)) : undefined
+    /** 会话当前是否真的处于"蜂巢模式开启"状态（on 才算）。 */
+    const hiveActiveFor = (sessionId) => {
+      const mission = missions.get(String(sessionId))
+      return Boolean(mission && mission.paused !== true)
     }
     if (sysPrompt && typeof sysPrompt.section === 'function') {
       try {
@@ -1167,11 +1174,11 @@ export function apply(ctx, rawConfig) {
           name: 'mission-control:hive',
           order: 945,
           text: () => {
-            if (missions.size === 0) return ''
             const agent = scopeAgent()
-            const mission = agent ? missions.get(String(agent.id)) : undefined
+            const sessionId = agent ? String(agent.id) : ''
+            const mission = agent ? missions.get(sessionId) : undefined
 
-            // 子会话（teammate）身份：只做分配给自己的事 + 汇报
+            // 会话没有蜂巢任务：只对历史 teammate 会话给一点协作提示；其余一律不注入
             if (!mission) {
               const team = services.team()
               let role
@@ -1180,7 +1187,17 @@ export function apply(ctx, rawConfig) {
               } catch {
                 role = undefined
               }
-              if (role !== 'teammate') return ''
+              if (role !== 'teammate') {
+                // 曾经是蜂巢帧、现在已回到普通模式：明确纠正历史里的旧指令
+                if (sessionId && hiveOffNotice.has(sessionId)) {
+                  return [
+                    '## 蜂巢模式已关闭（当前为普通会话）',
+                    '之前的蜂巢任务已经结束/暂停。**不要**再创建或分派子会话，也不要调用 `mission_*` 工具；',
+                    '按普通对话直接完成用户的新请求即可。',
+                  ].join('\n')
+                }
+                return ''
+              }
               return [
                 '## 蜂巢任务：你是子会话',
                 '你只负责完成分配给自己的子任务；需要协作时用 `send_message`，',
@@ -1193,6 +1210,18 @@ export function apply(ctx, rawConfig) {
               ].join('\n')
             }
 
+            // 模式被关闭（暂停）：明确告知按普通会话处理，不注入任何分派契约
+            if (mission.paused === true) {
+              hiveOffNotice.add(sessionId)
+              return [
+                '## 蜂巢模式已关闭（当前为普通会话）',
+                '本次蜂巢任务处于暂停/关闭状态：子会话继续工作，但你**不要再分派新任务**，',
+                '也不用再调用 `mission_*` 工具。按普通对话处理用户的新请求即可。',
+              ].join('\n')
+            }
+
+            // 模式开启：清除"已关闭"标记，注入分派契约
+            hiveOffNotice.delete(sessionId)
             const stats = missionScale(mission)
             if (stats.gap > 0 && mission.taskAt) {
               // 已收到任务但工蜂不足：催办补开
@@ -1275,6 +1304,7 @@ export function apply(ctx, rawConfig) {
     const existing = missions.get(sessionId)
 
     if (enabled) {
+      hiveOffNotice.delete(sessionId)
       if (existing) {
         existing.paused = false
         if (workers !== undefined) existing.cap = workers
@@ -1295,6 +1325,11 @@ export function apply(ctx, rawConfig) {
     } else if (existing) {
       existing.paused = true
       if (workers !== undefined) existing.cap = workers
+      // 关闭模式：标记该会话，让系统提示补一条"回到普通会话"的纠正指令
+      hiveOffNotice.add(sessionId)
+    } else {
+      // 没有任务但用户特意关掉开关：同样保证后续按普通会话处理
+      hiveOffNotice.add(sessionId)
     }
 
     const mission = missions.get(sessionId)
@@ -1946,6 +1981,8 @@ export function apply(ctx, rawConfig) {
         }
       }
       missions.delete(mission.sessionId)
+      // 任务已结束：让后续轮次明确回到普通会话，压掉历史里的旧分派契约
+      hiveOffNotice.add(String(mission.sessionId))
       stopped.push(mission.sessionId)
       finishing.push({ mission, members, boardDone, memberReports, root })
     }
