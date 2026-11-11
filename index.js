@@ -55,6 +55,9 @@ const DEFAULT_CONFIG = {
   blockDelegationOutsideHive: true,
   // 同一条交接链最多续任几代（按链根名统计），防止阈值配置异常时无限 spawn
   maxHandoffRounds: 3,
+  // 性能：面板快照缓存 TTL（0=关闭缓存）、上下文测量缓存 TTL
+  snapshotCacheTtlMs: 1000,
+  measureCacheTtlMs: 1000,
   imageKeywords: [
     '生图', '生成图片', '画图', '绘制', '插图', '配图', '出图',
     '海报', '封面图', '示意图', '图片生成', '文生图',
@@ -191,6 +194,8 @@ export function apply(ctx, rawConfig) {
   let persistTimer = null
   /** 去抖写盘（300ms），失败静默——持久化只是缓存，不能影响主流程。 */
   function persistState() {
+    // 任何任务状态变更都同时让面板快照失效，保证关键变化即时可见
+    invalidateSnapshot()
     if (persistTimer) return
     persistTimer = setTimeout(() => {
       persistTimer = null
@@ -519,23 +524,37 @@ export function apply(ctx, rawConfig) {
     return { workers, cap, openTasks: open.length, unownedTasks: unowned.length, target, gap }
   }
 
-  /** 测量一个成员会话的上下文压力。 */
+  /** 测量一个成员会话的上下文压力（带短时缓存，measure 为 O(surface)）。 */
   function measureMember(member) {
+    const id = String(member.id)
+    const ttl = Math.max(0, Number(config.measureCacheTtlMs) || 0)
+    const hit = measureCache.get(id)
+    if (ttl > 0 && hit && Date.now() - hit.at < ttl) return hit.value
     const sessions = services.sessions()
     const meter = services.meter()
-    const session = sessions?.get(member.id)
-    if (!session) return { tokens: 0, window: config.fallbackContextWindow, ratio: 0, known: false }
+    const session = sessions?.get(id)
+    if (!session) {
+      const empty = { tokens: 0, window: config.fallbackContextWindow, ratio: 0, known: false }
+      measureCache.set(id, { at: Date.now(), value: empty })
+      return empty
+    }
     let tokens = 0
     let window = config.fallbackContextWindow
+    let known = false
     try {
       const measurement = meter?.measure(session)
-      if (measurement && Number.isFinite(measurement.totalTokens)) tokens = measurement.totalTokens
+      if (measurement && Number.isFinite(measurement.totalTokens)) {
+        tokens = measurement.totalTokens
+        known = true
+      }
       const header = session.requestContext?.()
       if (header && Number.isFinite(header.contextWindow)) window = header.contextWindow
     } catch {
-      // 测量失败不影响主流程，按 0 处理
+      // 测量失败：标记 known=false，面板可据此提示"测量失败"而不是显示 0%
     }
-    return { tokens, window, ratio: window > 0 ? tokens / window : 0, known: true }
+    const value = { tokens, window, ratio: window > 0 ? tokens / window : 0, known }
+    measureCache.set(id, { at: Date.now(), value })
+    return value
   }
 
   function missionRows(mission) {
@@ -560,6 +579,94 @@ export function apply(ctx, rawConfig) {
   /** sessionId -> 工蜂自报的工作概括（current 一行 + completed 多行） */
   const reports = new Map()
 
+  // ── 性能：增量事件聚合 + 测量/快照缓存 ──────────────────────────────────
+  /**
+   * 每个工蜂会话的增量聚合游标。只处理 lastSeq 之后的新事件，
+   * 避免每次快照都从头遍历整段会话历史（历史只增不减，成本会随任务变大）。
+   */
+  const sessionAgg = new Map()
+
+  /** 把新增事件累加进游标，返回最新聚合值。 */
+  function aggregateSession(session, id) {
+    let agg = sessionAgg.get(id)
+    if (!agg) {
+      agg = { lastSeq: 0, turns: 0, toolCalls: 0, files: [], lastAction: '', actualModel: '' }
+      sessionAgg.set(id, agg)
+    }
+    let events
+    try {
+      events = session.snapshotEvents()
+    } catch {
+      return agg
+    }
+    // 会话被 clear/fork/压缩后事件数可能回退：重置游标重算
+    if (events.length < agg.lastSeq) {
+      agg.lastSeq = 0
+      agg.turns = 0
+      agg.toolCalls = 0
+      agg.files = []
+      agg.lastAction = ''
+      agg.actualModel = ''
+    }
+    for (let i = agg.lastSeq; i < events.length; i += 1) {
+      const event = events[i]
+      if (event.type === 'turn/end') {
+        agg.turns += 1
+      } else if (event.type === 'tool/call') {
+        agg.toolCalls += 1
+        const toolName = event.data?.name
+        if (toolName === 'write' || toolName === 'edit') {
+          try {
+            const args = JSON.parse(event.data?.arguments ?? '{}')
+            const path = args.file_path ?? args.path
+            if (typeof path === 'string' && path && !agg.files.includes(path)) {
+              agg.files.push(path)
+              if (agg.files.length > 50) agg.files.shift()
+            }
+          } catch {
+            // 参数不是 JSON 就忽略
+          }
+        }
+      } else if (event.type === 'assistant/message') {
+        const source = event.data?.message?.source
+        if (source && source.provider) agg.actualModel = `${source.provider}/${source.model}`
+        const text = blocksToText(event.data?.message?.content)
+        if (text) agg.lastAction = text
+      }
+    }
+    agg.lastSeq = events.length
+    return agg
+  }
+
+  /** 上下文测量缓存：measure 是 O(surface)，短时间内复用同一结果。 */
+  const measureCache = new Map()
+
+  /** Dashboard 快照缓存 + single-flight：并发请求共享同一次计算。 */
+  let snapshotCache = { at: 0, data: null }
+  let snapshotInFlight = null
+
+  function invalidateSnapshot() {
+    snapshotCache = { at: 0, data: null }
+  }
+
+  async function cachedDashboardSnapshot() {
+    const ttl = Math.max(0, Number(config.snapshotCacheTtlMs) || 0)
+    if (ttl > 0 && snapshotCache.data && Date.now() - snapshotCache.at < ttl) {
+      return snapshotCache.data
+    }
+    if (snapshotInFlight) return snapshotInFlight
+    snapshotInFlight = Promise.resolve()
+      .then(() => dashboardSnapshot())
+      .then((data) => {
+        snapshotCache = { at: Date.now(), data }
+        return data
+      })
+      .finally(() => {
+        snapshotInFlight = null
+      })
+    return snapshotInFlight
+  }
+
   /** 把一段（可能是英文的）动作文本压成一句短概括。 */
   function deriveShort(text) {
     if (!text) return ''
@@ -581,47 +688,20 @@ export function apply(ctx, rawConfig) {
     const boardCompleted = owned.filter((t) => t.status === 'completed').map((t) => t.subject)
     const boardCurrent = owned.filter((t) => t.status === 'in_progress').map((t) => t.subject)
 
-    let turns = 0
-    let toolCalls = 0
-    let lastAction = ''
-    let actualModel = ''
-    const files = []
-
+    // 增量聚合：只处理会话新增事件，不再每次从头遍历整段历史
+    let agg = { turns: 0, toolCalls: 0, files: [], lastAction: '', actualModel: '' }
     if (session) {
       try {
-        const events = session.snapshotEvents()
-        for (const event of events) {
-          if (event.type === 'turn/end') turns += 1
-          else if (event.type === 'tool/call') {
-            toolCalls += 1
-            const name = event.data?.name
-            if (name === 'write' || name === 'edit') {
-              try {
-                const args = JSON.parse(event.data?.arguments ?? '{}')
-                const path = args.file_path ?? args.path
-                if (typeof path === 'string' && !files.includes(path)) files.push(path)
-              } catch {
-                // 参数不是 JSON 就忽略
-              }
-            }
-          }
-        }
-        for (let i = events.length - 1; i >= 0; i -= 1) {
-          if (events[i].type !== 'assistant/message') continue
-          const source = events[i].data?.message?.source
-          if (source && source.provider && !actualModel) {
-            actualModel = `${source.provider}/${source.model}`
-          }
-          const text = blocksToText(events[i].data?.message?.content)
-          if (text) {
-            lastAction = text
-            break
-          }
-        }
+        agg = aggregateSession(session, String(member.id))
       } catch {
         // 会话已关闭或日志不可读
       }
     }
+    const turns = agg.turns
+    const toolCalls = agg.toolCalls
+    const lastAction = agg.lastAction
+    const actualModel = agg.actualModel
+    const files = agg.files
 
     // 优先用工蜂自己上报的概括，其次任务板标题，最后从会话日志压一句
     const report = reports.get(String(member.id)) ?? {}
@@ -1277,6 +1357,8 @@ export function apply(ctx, rawConfig) {
         if (next.completed.length > 8) next.completed = next.completed.slice(-8)
       }
       reports.set(key, next)
+      // 汇报内容变化后让面板快照即时刷新
+      invalidateSnapshot()
       return Promise.resolve({ ok: true })
     },
     presentCall: (args) => ({
@@ -1601,7 +1683,7 @@ export function apply(ctx, rawConfig) {
           kind: 'exact',
           path: '/mission-dashboard-v2.json',
           resource: async () =>
-            new Response(JSON.stringify(dashboardSnapshot()), {
+            new Response(JSON.stringify(await cachedDashboardSnapshot()), {
               status: 200,
               headers: { 'content-type': 'application/json; charset=utf-8' },
             }),
@@ -2648,6 +2730,100 @@ export function apply(ctx, rawConfig) {
           } catch {
             // 已注销
           }
+        }
+      }
+    })
+  }
+
+  // ── 诊断端点：确认服务可用性与成员会话可见性（只读）──────────────────────
+  if (ctx.webServer && typeof ctx.webServer.register === 'function') {
+    ctx.effect(() => {
+      let dispose
+      try {
+        dispose = ctx.webServer.register({
+          kind: 'exact',
+          path: '/mission-diag-v1',
+          resource: async (request) => {
+            // 可选：?probe=<sessionId> 对指定会话跑两次增量聚合，验证增量逻辑与耗时
+            let probeId
+            try {
+              const url = new URL(request?.url ?? '/', 'http://127.0.0.1')
+              probeId = url.searchParams.get('probe') ?? undefined
+            } catch {
+              // 无查询参数
+            }
+            let probe
+            if (probeId) {
+              const session = services.sessions()?.get(probeId)
+              if (!session) {
+                probe = { sessionId: probeId, found: false }
+              } else {
+                sessionAgg.delete(probeId)
+                const t0 = Date.now()
+                const first = aggregateSession(session, probeId)
+                const t1 = Date.now()
+                const second = aggregateSession(session, probeId)
+                const t2 = Date.now()
+                probe = {
+                  sessionId: probeId,
+                  found: true,
+                  events: first.lastSeq,
+                  turns: first.turns,
+                  toolCalls: first.toolCalls,
+                  files: first.files.length,
+                  lastActionLen: first.lastAction.length,
+                  firstMs: t1 - t0,
+                  secondMs: t2 - t1,
+                  stable: first.turns === second.turns && first.toolCalls === second.toolCalls,
+                }
+              }
+            }
+            const payload = {
+              at: Date.now(),
+              probe,
+              services: {
+                sessions: Boolean(services.sessions()),
+                agents: Boolean(services.agents()),
+                meter: Boolean(services.meter()),
+                team: Boolean(services.team()),
+              },
+              cachedSessions: sessionAgg.size,
+              missions: [...missions.values()].map((mission) => ({
+                sessionId: mission.sessionId,
+                members: activeMembersOf(mission).map((member) => {
+                  const id = String(member.id)
+                  const session = services.sessions()?.get(id)
+                  let events = -1
+                  try {
+                    events = session ? session.snapshotEvents().length : -2
+                  } catch {
+                    events = -3
+                  }
+                  return {
+                    name: member.name,
+                    id,
+                    status: member.status,
+                    sessionFound: Boolean(session),
+                    events,
+                    agg: sessionAgg.get(id) ?? null,
+                  }
+                }),
+              })),
+            }
+            return new Response(JSON.stringify(payload), {
+              status: 200,
+              headers: { 'content-type': 'application/json; charset=utf-8' },
+            })
+          },
+        })
+      } catch {
+        return () => {}
+      }
+      return () => {
+        try {
+          dispose()
+        } catch {
+          // 已随旧 fiber 注销
         }
       }
     })

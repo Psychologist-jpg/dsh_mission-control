@@ -70,12 +70,13 @@ Mission Control 让一个 Lead 会话把多个工蜂组织成一场「任务（M
    - 该自动切换受 `imageModelSwitch` 开关控制，**默认关闭**（守住「图像模型不能对话」这条线，只提供 `mission_image` 工具）。
 
 8. **实时进度悬浮窗（Dashboard）**
-   `dashboard.js` 在 Web 客户端注入悬浮层（`shell.overlay`），每 2 秒轮询 `/mission-dashboard-v2.json`，**每个主会话渲染一个独立悬浮窗**：
-   - 可拖动、可折叠，位置与折叠状态按会话分别保存在 `localStorage`，多窗口默认错开不重叠；
+   `dashboard.js` 在 Web 客户端注入悬浮层（`shell.overlay`），每 2 秒轮询 `/mission-dashboard-v2.json`，**每个主会话渲染一个独立悬浮窗**：   - 可拖动、可折叠，位置与折叠状态按会话分别保存在 `localStorage`，多窗口默认错开不重叠；
    - 标题显示会话标题（来自 `sessionTitle` 服务，取不到则回退「会话 <id 尾号>」）；
    - 显示配平统计（现有/上限工蜂、待办数、建议再开数）、工蜂状态徽标、上下文占用进度条（绿 → 黄 → 红）、当前任务、已完成任务、产出文件、**当前模型**（优先取实际使用的模型，其次策略指定值）、暂停状态；
    - 顶部人数选择器只改上限（`workersOnly`），**不会**误触发开启/关闭蜂巢模式；
    - 「结束任务」按钮会带上本窗口所属 `sessionId` 调用 `POST /mission-end-v1`（后端拒绝「不带 sessionId 结束全部」），失败时弹窗提示原因，绝不显示成功卡片；结束后弹出可拖动、可关闭的结束提示卡片，15 秒后自动消失。
+
+   **性能设计**：面板轮询不会随任务变长而变慢——快照按 `snapshotCacheTtlMs` 缓存并对并发请求做 single-flight，上下文测量按 `measureCacheTtlMs` 复用，成员会话事件用**增量聚合游标**只处理新增事件（不再每次从头遍历历史；会话 clear/fork 导致事件数回退时自动重置重算）。任务状态变更（建任务、开人、汇报、结束等）会立即让快照失效，保证关键变化即时可见。
 
    另外，任务进行中会通过 `systemPrompt.section` 注入「分派契约 / 催办 / 汇报」三段式提示（见上文「任务拆解与人数配平」），并提示子会话「需要生图时调用 `mission_image`，不要切换自己的对话模型」；没有任务时不注入任何内容。
 
@@ -158,6 +159,8 @@ Mission Control 让一个 Lead 会话把多个工蜂组织成一场「任务（M
 | `fallbackContextWindow` | `131072` | 拿不到真实上下文窗口大小时使用的分母。 |
 | `freshProvider` | `"spawn"` | 交接时创建续任者使用的 provider 参数。 |
 | `maxHandoffRounds` | `3` | 同一条交接链（按链根名统计）最多续任几代，防止阈值异常时无限 spawn。 |
+| `snapshotCacheTtlMs` | `1000` | 面板快照缓存 TTL（0=关闭缓存）。并发轮询共享同一次计算（single-flight），任务状态变更会立即失效。 |
+| `measureCacheTtlMs` | `1000` | 上下文测量缓存 TTL。`tokenMeter.measure()` 是 O(surface)，短时复用避免多面板反复测量。 |
 | `requireHiveModeForSpawns` | `true` | 未开启蜂巢模式时禁止 `spawn_teammate`。设为 `false` 可放开。 |
 | `blockDelegationOutsideHive` | `true` | 未开启蜂巢模式时是否也禁止 `subagent` / `subagent_fork` / `workflow`；设为 `false` 恢复平台原生并行能力。 |
 | `deleteSessionLogs` | `false` | 结束任务 / 删除子会话时是否物理删除其日志文件（默认仅归档，不删记录）。 |
@@ -210,6 +213,7 @@ Mission Control 让一个 Lead 会话把多个工蜂组织成一场「任务（M
 | `GET /mission-children-v1?sessionId=...` | 列出该会话下的所有子会话（id / 名称 / 状态 / 描述），并按普通 → 归档 → 已删除排序；每条带 `archived`（是否已归档）与 `exists`（磁盘上是否还有会话目录）。可选 `includeArchived=1`、`includeDeleted=1`。响应另含 `total`、`activeCount`、`archivedCount`、`deletedCount`。 |
 | `POST /mission-archive-v1` | 归档 / 取消归档（可逆）：`{ "sessionId": "...", "childIds": [...], "action": "archive" \| "unarchive" }`。归档会先停止运行中的会话；对磁盘上已不存在的会话只清理归档残留并报错提示。 |
 | `POST /mission-delete-v1` | 删除指定子会话：`{ "sessionId": "...", "childIds": [...], "hard": true }`。默认**彻底删除**：停止 → 解除归档 → 删除会话日志目录与投影缓存（返回 `removedLogs`、`removedCaches`）；`hard: false` 退化为仅归档。 |
+| `GET /mission-diag-v1` | **只读诊断**：返回各服务是否可用、已缓存聚合的会话数、每个任务下活跃成员及其会话可见性与事件数、聚合游标值。可选 `?probe=<sessionId>` 对指定会话连跑两次增量聚合，返回耗时与 `stable`（两次结果一致），用于排查「面板不动 / 工蜂事件读不到」类问题。 |
 
 ---
 
