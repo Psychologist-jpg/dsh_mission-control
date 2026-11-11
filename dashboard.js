@@ -19,6 +19,8 @@ window.__ModuleLoader__.load({
     // ── 主题 token（深色/浅色自动适配）──────────────────────────────────────
     const T = {
       bg: 'var(--dsw-alias-bg-layer-2)',
+      // 浮层（下拉菜单 / 弹窗）背景：与宿主菜单一致，缺失时退回面板色
+      panelBg: 'var(--dsw-specific-menu, var(--dsw-alias-bg-overlay, var(--dsw-alias-bg-layer-2)))',
       border: 'var(--dsw-alias-border-l1)',
       text: 'var(--dsw-alias-label-primary)',
       secondary: 'var(--dsw-alias-label-secondary)',
@@ -563,23 +565,26 @@ window.__ModuleLoader__.load({
         return () => { alive = false; clearInterval(timer); };
       }, [load]);
 
-      const push = async (enabled, cap) => {
+      const push = async (enabled, cap, workersOnly = false) => {
         if (busy) return;
         setBusy(true);
-        setState((s) => ({ ...s, active: enabled ? true : s.active, enabled }));
+        if (!workersOnly) setState((s) => ({ ...s, active: enabled ? true : s.active, enabled }));
         try {
+          const payload = { sessionId, enabled, workers: cap };
+          if (workersOnly) payload.workersOnly = true;
           const res = await fetch(MODE_ENDPOINT, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ sessionId, enabled, workers: cap }),
+            body: JSON.stringify(payload),
           });
           const result = await res.json().catch(() => ({}));
           if (result && result.ok) {
-            setState({
+            setState((s) => ({
               active: Boolean(result.active),
-              enabled: Boolean(result.enabled),
+              // workersOnly 不改启停状态
+              enabled: workersOnly ? s.enabled : Boolean(result.enabled),
               cap: Number.isFinite(result.cap) ? result.cap : cap,
-            });
+            }));
           } else {
             await load();
           }
@@ -624,7 +629,7 @@ window.__ModuleLoader__.load({
         h(NumberPicker, {
           value: state.cap,
           disabled: busy,
-          onChange: (n) => { push(state.enabled || state.active, n); },
+          onChange: (n) => { push(state.enabled, n, true); },
         }),
         h('span', { style: { color: T.secondary, fontSize: 11 } }, '个'),
         h('button', {
@@ -782,9 +787,16 @@ window.__ModuleLoader__.load({
           const res = await fetch(STOP_ENDPOINT, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({}),
+            // 必须带本窗口所属主会话：后端不会退化为「结束全部」
+            body: JSON.stringify({ sessionId: mission.sessionId }),
           });
           const result = await res.json().catch(() => ({}));
+          // 后端失败（400 缺 sessionId / 404 无该任务 / 500）绝不能显示成功卡片
+          if (!res.ok || result.ok === false) {
+            const reason = (result && (result.message || result.error)) || `HTTP ${res.status}`;
+            window.alert(`结束任务失败：${reason}`);
+            return;
+          }
           const deleted = (result.cleanup && result.cleanup.deleted) || [];
           const interrupted = result.interrupted || [];
           const files = result.resultFiles || [];

@@ -7,3 +7,7 @@
         handoffRatio: 0.85
         defaultCap: 3
         freshProvider: spawn
+        maxHandoffRounds: 3
+        # 方案 A：蜂巢开关是子会话的唯一入口
+        requireHiveModeForSpawns: true
+        blockDelegationOutsideHive: true

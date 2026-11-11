@@ -11,7 +11,7 @@
  */
 
 import { readdir, unlink, rm, mkdir, writeFile } from 'node:fs/promises'
-import { existsSync, statSync, readdirSync, readFileSync } from 'node:fs'
+import { existsSync, statSync, readdirSync, readFileSync, mkdirSync, writeFileSync, renameSync } from 'node:fs'
 import { join, resolve, sep, dirname } from 'node:path'
 
 const DEFAULT_CONFIG = {
@@ -48,6 +48,13 @@ const DEFAULT_CONFIG = {
   imageApiBaseUrl: 'https://api.llm.ustc.edu.cn/v1',
   imageApiKeyRef: 'USTC_API_KEY',
   imageApiSize: '1024x1024',
+  // 未开启蜂巢模式时禁止创建团队工蜂（spawn_teammate）
+  requireHiveModeForSpawns: true,
+  // 未开启蜂巢模式时是否也禁止平台内置的 subagent / subagent_fork / workflow 委派
+  // 方案 A：开关是唯一入口，默认开启（去关闭可恢复平台原生并行能力）
+  blockDelegationOutsideHive: true,
+  // 同一条交接链最多续任几代（按链根名统计），防止阈值配置异常时无限 spawn
+  maxHandoffRounds: 3,
   imageKeywords: [
     '生图', '生成图片', '画图', '绘制', '插图', '配图', '出图',
     '海报', '封面图', '示意图', '图片生成', '文生图',
@@ -61,6 +68,12 @@ function needsImageModel(text, keywords) {
   if (!source) return false
   return (keywords ?? []).some((kw) => kw && source.includes(String(kw).toLowerCase()))
 }
+
+/** 路由请求体最大字节数（防止无上限 body）。 */
+const MAX_BODY_BYTES = 64 * 1024
+
+/** 会产出文件的工具：只有这些工具调用里的路径才算"结果文件"。 */
+const WRITE_TOOLS = new Set(['write', 'edit', 'mission_image', 'present'])
 
 /** 把一个 glob（仅支持 * 和 ?）编译成正则。 */
 function globToRegExp(glob) {
@@ -118,6 +131,163 @@ export function apply(ctx, rawConfig) {
    */
   const hiveOffNotice = new Set()
 
+  // ── C1 持久化：任务状态落盘，重启/重载后恢复 ──────────────────────────────
+  const stateDir = () => join(dshHome(), 'storages', 'mission-control')
+  const stateFile = () => join(stateDir(), 'missions.json')
+  const STATE_TTL_MS = 7 * 24 * 60 * 60 * 1000
+
+  /** mission → 可 JSON 化的普通对象（Set/Map 转数组）。 */
+  function serializeMission(mission) {
+    const arr = (value) => (value instanceof Set ? [...value] : [])
+    const entries = (value) =>
+      value instanceof Map ? [...value.entries()] : []
+    return {
+      sessionId: mission.sessionId,
+      task: mission.task,
+      taskAt: mission.taskAt ?? null,
+      cap: mission.cap,
+      startedAt: mission.startedAt,
+      paused: mission.paused === true,
+      baseline: arr(mission.baseline),
+      baselineTasks: arr(mission.baselineTasks),
+      handedOff: arr(mission.handedOff),
+      retired: arr(mission.retired),
+      handoffRounds: entries(mission.handoffRounds),
+      handoffChainRounds: entries(mission.handoffChainRounds),
+      workerModels: entries(mission.workerModels),
+      workerBaseModels: entries(mission.workerBaseModels),
+      lastHandoff: mission.lastHandoff ?? null,
+      lastError: mission.lastError ?? null,
+      updatedAt: Date.now(),
+    }
+  }
+
+  /** 普通对象 → mission（恢复 Set/Map 与默认值）。 */
+  function deserializeMission(raw) {
+    const asSet = (value) => new Set(Array.isArray(value) ? value : [])
+    const asMap = (value) => new Map(Array.isArray(value) ? value : [])
+    return {
+      sessionId: String(raw.sessionId),
+      task: String(raw.task ?? ''),
+      taskAt: Number(raw.taskAt) || undefined,
+      cap: Number(raw.cap) || Number(config.defaultCap) || 3,
+      startedAt: Number(raw.startedAt) || Date.now(),
+      paused: raw.paused === true,
+      baseline: asSet(raw.baseline),
+      baselineTasks: asSet(raw.baselineTasks),
+      handoffInFlight: new Set(),
+      handoffRounds: asMap(raw.handoffRounds),
+      handoffChainRounds: asMap(raw.handoffChainRounds),
+      handedOff: asSet(raw.handedOff),
+      retired: asSet(raw.retired),
+      workerModels: asMap(raw.workerModels),
+      workerBaseModels: asMap(raw.workerBaseModels),
+      lastHandoff: raw.lastHandoff ?? undefined,
+      lastError: raw.lastError ?? undefined,
+      restoredAt: Date.now(),
+    }
+  }
+
+  let persistTimer = null
+  /** 去抖写盘（300ms），失败静默——持久化只是缓存，不能影响主流程。 */
+  function persistState() {
+    if (persistTimer) return
+    persistTimer = setTimeout(() => {
+      persistTimer = null
+      try {
+        const dir = stateDir()
+        mkdirSync(dir, { recursive: true })
+        const file = stateFile()
+        const payload = {
+          version: 1,
+          savedAt: Date.now(),
+          missions: [...missions.values()].map(serializeMission),
+        }
+        const tmp = `${file}.tmp`
+        writeFileSync(tmp, JSON.stringify(payload), 'utf8')
+        renameSync(tmp, file)
+      } catch {
+        // 写入失败时下次变更会再试
+      }
+    }, 300)
+  }
+
+  /**
+   * 对账：把恢复出来的任务与磁盘/花名册对齐。
+   * - 已删除或已归档的成员 → 移入 retired（不再算活跃、不再收广播）
+   * - 花名册里不存在的名字 → 从 handedOff/retired 里剔除
+   */
+  async function reconcileMission(mission, indexArg) {
+    const index = indexArg ?? (await sessionDirIndex())
+    const archivedSet = archivedSessionIds()
+    const agent = services.agents()?.get(mission.sessionId)
+    const roster = agent ? teammatesOf(agent) : []
+    const rosterNames = new Set(roster.map((m) => String(m.name)))
+    let changed = false
+
+    for (const name of [...(mission.handedOff ?? [])]) {
+      if (!rosterNames.has(String(name))) {
+        mission.handedOff.delete(name)
+        changed = true
+      }
+    }
+    for (const name of [...(mission.retired ?? [])]) {
+      if (!rosterNames.has(String(name))) {
+        mission.retired.delete(name)
+        changed = true
+      }
+    }
+    mission.retired = mission.retired ?? new Set()
+    const baseline = mission.baseline ?? new Set()
+    for (const member of roster) {
+      const name = String(member.name)
+      if (baseline.has(name)) continue
+      const id = String(member.id)
+      const alive = index.has(id) && !archivedSet.has(id)
+      if (!alive && !mission.retired.has(name)) {
+        mission.retired.add(name)
+        changed = true
+      }
+    }
+    if (changed) persistState()
+    return changed
+  }
+
+  /** 启动时恢复：过期/会话已不存在的任务直接丢弃。 */
+  async function loadPersistedState() {
+    try {
+      const file = stateFile()
+      if (!existsSync(file)) return
+      const raw = JSON.parse(readFileSync(file, 'utf8'))
+      const list = Array.isArray(raw?.missions) ? raw.missions : []
+      const index = await sessionDirIndex()
+      let loaded = 0
+      for (const item of list) {
+        const sid = String(item?.sessionId ?? '')
+        if (!sid) continue
+        const updatedAt = Number(item.updatedAt) || 0
+        if (updatedAt && Date.now() - updatedAt > STATE_TTL_MS) continue
+        // 主会话必须仍然存在（live 或磁盘有日志），否则丢弃
+        const exists = services.agents()?.get(sid) || index.has(sid.replace(/^session-/, ''))
+        if (!exists) continue
+        missions.set(sid, deserializeMission(item))
+        loaded += 1
+      }
+      for (const mission of [...missions.values()]) {
+        await reconcileMission(mission, index)
+      }
+      if (loaded > 0) {
+        // 让恢复出来的会话回到正确提示状态
+        for (const mission of missions.values()) {
+          if (mission.paused === true) hiveOffNotice.add(mission.sessionId)
+          else hiveOffNotice.delete(mission.sessionId)
+        }
+      }
+    } catch {
+      // 损坏的状态文件不应阻止插件启动
+    }
+  }
+
   const services = {
     team: () => ctx.get('agentTeams'),
     agents: () => ctx.get('agents'),
@@ -145,12 +315,46 @@ export function apply(ctx, rawConfig) {
     }
   }
 
+  /**
+   * 当前会话正在使用的模型（用于 revert 时真正切回）。
+   * 优先读 Agent 创建时的 options（刚 spawn、还没发过请求也有值）；
+   * 再退回请求上下文（已发生过请求的会话）。
+   */
+  function currentModelOf(memberId) {
+    try {
+      const live = services.agents()?.get(String(memberId))
+      const opts = live?.options
+      if (opts && opts.provider && opts.model) {
+        return { provider: opts.provider, model: opts.model }
+      }
+    } catch {
+      // 忽略
+    }
+    try {
+      const session = services.sessions()?.get(String(memberId))
+      const ctxInfo = session?.requestContext?.()
+      if (ctxInfo && ctxInfo.provider && ctxInfo.model) {
+        return { provider: ctxInfo.provider, model: ctxInfo.model }
+      }
+    } catch {
+      // 忽略
+    }
+    return undefined
+  }
+
   /** 切换某个子会话的模型：优先用 agent.model.select()（平台要求在 step 准备前）。 */
   async function switchMemberModel(mission, agent, name, provider, model) {
     const member = teammatesOf(agent).find((m) => String(m.name) === String(name))
     if (!member) return { ok: false, error: `找不到成员 ${name}` }
     const target = services.agents()?.get(String(member.id))
     if (!target) return { ok: false, error: `成员 ${name} 不在线` }
+
+    // 首次切换前记录原模型，供 mission_set_model(revert) 真正切回
+    mission.workerBaseModels = mission.workerBaseModels ?? new Map()
+    if (!mission.workerBaseModels.has(String(name))) {
+      const base = currentModelOf(member.id)
+      if (base) mission.workerBaseModels.set(String(name), base)
+    }
 
     const selection = { provider, model }
     try {
@@ -264,6 +468,33 @@ export function apply(ctx, rawConfig) {
     return teammatesOf(agent).filter((m) => !baseline.has(m.name))
   }
 
+  /**
+   * 统一口径：任务的「活跃工蜂」。
+   * = missionMembers − 已交接（handedOff）− 已退休（retired：归档/删除过的成员）。
+   * 所有计数、上限判定、面板显示、广播、哨兵都只认这一份名单，
+   * 避免出现 guard / mission_scale / handoff 三套口径不一致。
+   */
+  function activeMembersOf(mission) {
+    if (!mission) return []
+    const handedOff = mission.handedOff ?? new Set()
+    const retired = mission.retired ?? new Set()
+    return missionMembers(mission).filter((m) => {
+      const name = String(m.name)
+      return !handedOff.has(name) && !retired.has(name)
+    })
+  }
+
+  /** 把成员标记为「退休」，立即从活跃名单移除（归档/删除/交接时调用）。 */
+  function retireMembers(sessionId, names) {
+    const mission = missions.get(String(sessionId))
+    if (!mission) return
+    mission.retired = mission.retired ?? new Set()
+    for (const name of names ?? []) {
+      if (name) mission.retired.add(String(name))
+    }
+    persistState()
+  }
+
   /** 当前任务的任务板条目（排除开任务前已有的旧任务）。 */
   function missionTasks(mission) {
     const agent = services.agents()?.get(mission.sessionId)
@@ -280,7 +511,8 @@ export function apply(ctx, rawConfig) {
     const tasks = missionTasks(mission)
     const open = tasks.filter((t) => t.status === 'pending' || t.status === 'in_progress')
     const unowned = open.filter((t) => !t.ownerName)
-    const workers = missionMembers(mission).length
+    // 活跃工蜂：统一口径（排除已交接 / 已退休），避免出现 4/2 这种越界计数
+    const workers = activeMembersOf(mission).length
     const cap = Number(mission.cap) || 1
     const target = Math.min(Math.max(unowned.length, open.length ? 1 : 0), cap)
     const gap = Math.max(0, target - workers)
@@ -310,25 +542,16 @@ export function apply(ctx, rawConfig) {
     const agent = services.agents()?.get(mission.sessionId)
     if (!agent) return { agent: undefined, rows: [] }
     const tasks = missionTasks(mission)
-    const sessions = services.sessions()
-    const rows = missionMembers(mission).map((member) => {
+    const rows = activeMembersOf(mission).map((member) => {
       const usage = measureMember(member)
-      const owned = tasks.filter((t) => t.ownerName === member.name)
-      const memberSession = sessions?.get(member.id)
-      const recent = memberSession ? recentAssistantText(memberSession, 1)[0] : ''
+      const owned = tasks.filter((t) => t.ownerName === member.name && t.status !== 'completed')
       return {
         name: member.name,
         status: member.status,
         tokens: usage.tokens,
         contextWindow: usage.window,
         ratio: Math.round(usage.ratio * 1000) / 1000,
-        // 当前任务 = 认领的进行中/待办；已完成任务 = 认领的已完结
-        currentTasks: owned
-          .filter((t) => t.status === 'in_progress' || t.status === 'pending')
-          .map((t) => t.subject),
-        completedTasks: owned.filter((t) => t.status === 'completed').map((t) => t.subject),
-        activeTasks: owned.filter((t) => t.status !== 'completed').map((t) => t.subject),
-        recentNote: recent ? recent.slice(0, 240) : '',
+        activeTasks: owned.map((t) => t.subject),
       }
     })
     return { agent, rows }
@@ -459,7 +682,7 @@ export function apply(ctx, rawConfig) {
         // 标题服务不可用时退回 id
       }
       if (!title) title = `会话 ${String(mission.sessionId).slice(-6)}`
-      const teammates = missionMembers(mission).map((member) => {
+      const teammates = activeMembersOf(mission).map((member) => {
         const usage = measureMember(member)
         return {
           name: member.name,
@@ -531,31 +754,69 @@ export function apply(ctx, rawConfig) {
   }
 
   async function handoff(mission, agent, member) {
-    if (mission.handoffInFlight.has(member.name)) return
-    mission.handoffInFlight.add(member.name)
+    const name = String(member.name)
+    // 续任者形如 <root>-r1 / <root>-r1-r1：按链根去重，避免"换名字就绕过"
+    const root = name.replace(/(?:-r\d+)+$/, '')
+    // 同一成员只交接一次：已交接过、或正在交接，直接跳过
+    if (mission.handoffInFlight.has(name)) return
+    if (mission.handedOff?.has(name)) return
+    mission.handoffInFlight.add(name)
     try {
       const team = services.team()
+      // 整条链的代数上限：防止阈值配置异常/续任者立刻超线导致无限 spawn
+      const chainRounds = mission.handoffChainRounds?.get(root) ?? 0
+      const maxRounds = Number(config.maxHandoffRounds) || 0
+      if (maxRounds > 0 && chainRounds >= maxRounds) {
+        mission.lastError = `交接被跳过：${root} 的交接链已达上限 ${maxRounds} 代`
+        mission.handedOff?.add(name)
+        return
+      }
+      // 交接是「替换」：退休的旧成员会被标记 handedOff、归档并移出活跃名单。
+      // 因此按统一口径的「活跃工蜂数」判定，满员任务同样可以交接。
+      if (activeMembersOf(mission).length > mission.cap) {
+        mission.lastError = `交接被跳过：活跃工蜂已超过上限 ${mission.cap}`
+        mission.handedOff?.add(name)
+        return
+      }
       const digest = buildDigest(mission, agent, member)
       try {
-        team.interrupt(agent, member.name)
+        team.interrupt(agent, name)
       } catch {
         // 可能已经处于 inactive，忽略
       }
-      const round = (mission.handoffRounds.get(member.name) ?? 0) + 1
-      mission.handoffRounds.set(member.name, round)
+      const round = (mission.handoffRounds.get(name) ?? 0) + 1
+      mission.handoffRounds.set(name, round)
       await team.spawnTeammate(agent, {
-        name: `${member.name}-r${round}`,
-        description: `接替 ${member.name}（上下文交接）`,
+        name: `${name}-r${round}`,
+        description: `接替 ${name}（上下文交接）`,
         prompt: [textBlock(digest)],
         context: 'fresh',
         provider: config.freshProvider,
         signal: new AbortController().signal,
       })
-      mission.lastHandoff = { from: member.name, to: `${member.name}-r${round}`, at: Date.now() }
+      // 标记已交接：哨兵与广播都不再把它当作可继续工作的成员
+      mission.handedOff?.add(name)
+      // 退休旧成员：归档它，使它真正让出活跃名额（失败不影响交接结果）
+      try {
+        const registry = ctx.get('workspaceRegistry')
+        if (registry && typeof registry.archiveSession === 'function') {
+          await registry.archiveSession(member.id, { stopActivity: true })
+          archivedCache = { at: 0, ids: new Set() }
+        }
+      } catch {
+        // 归档失败时，handedOff 标记仍然使哨兵/广播跳过它
+      }
+      // 记录整条链的代数（按链根计），用于 maxHandoffRounds 上限
+      mission.handoffChainRounds = mission.handoffChainRounds ?? new Map()
+      mission.handoffChainRounds.set(root, chainRounds + 1)
+      mission.lastHandoff = { from: name, to: `${name}-r${round}`, at: Date.now() }
     } catch (error) {
       mission.lastError = errText(error)
+      // 失败也标记，避免每 15 秒重复重试造成风暴
+      mission.handedOff?.add(name)
     } finally {
-      mission.handoffInFlight.delete(member.name)
+      mission.handoffInFlight.delete(name)
+      persistState()
     }
   }
 
@@ -565,11 +826,12 @@ export function apply(ctx, rawConfig) {
     const agent = services.agents()?.get(mission.sessionId)
     const team = services.team()
     if (!agent || !team) return 0
-    const members = missionMembers(mission)
+    // 只发给活跃工蜂：已交接 / 已退休 / 已删除 的成员一律不接收广播
+    const members = activeMembersOf(mission)
     if (members.length === 0) return 0
     const signal = new AbortController().signal
     let sent = 0
-    // 只发给存活会话：花名册里的已删除/已归档条目不再接收广播
+    // 再按磁盘存活过滤：花名册里的已删除/已归档条目不再接收广播
     void liveMembers(agent).then((live) => {
       const liveNames = new Set(live.map((m) => m.name))
       for (const member of members) {
@@ -655,8 +917,10 @@ export function apply(ctx, rawConfig) {
           baselineTasks: new Set(tasksOf(agent).map((t) => t.id)),
           handoffInFlight: new Set(),
           handoffRounds: new Map(),
+          handedOff: new Set(),
         })
       }
+      persistState()
       return Promise.resolve({
         ok: true,
         workers: Number(args.workers),
@@ -750,7 +1014,8 @@ export function apply(ctx, rawConfig) {
       const team = services.team()
       if (!team) throw new Error('Agent Teams 服务不可用')
 
-      const existing = new Set(missionMembers(mission).map((m) => m.name))
+      // 统一口径：只有活跃工蜂算"已存在"与占名额
+      const existing = new Set(activeMembersOf(mission).map((m) => m.name))
       const spawned = []
       const skipped = []
       const refused = []
@@ -780,8 +1045,8 @@ export function apply(ctx, rawConfig) {
           skipped.push(rawName)
           continue
         }
-        const current = missionMembers(mission)
-        if (current.length >= mission.cap) {
+        // 名额按活跃工蜂计：已交接 / 已退休的成员不再占用名额
+        if (activeMembersOf(mission).length >= mission.cap) {
           refused.push(rawName)
           continue
         }
@@ -818,13 +1083,14 @@ export function apply(ctx, rawConfig) {
         }
       }
 
+      persistState()
       return {
         spawned,
         skipped,
         refused,
         modelSwitches,
         modelErrors,
-        workers: missionMembers(mission).length,
+        workers: activeMembersOf(mission).length,
         cap: mission.cap,
       }
     },
@@ -883,8 +1149,19 @@ export function apply(ctx, rawConfig) {
       const mission = missions.get(String(agent.id))
       if (!mission) throw new Error('没有进行中的蜂巢任务，请先调用 mission_start')
       if (args.revert === true) {
-        mission.workerModels?.delete(String(args.name))
-        return { ok: true, model: 'default' }
+        const name = String(args.name)
+        const base = mission.workerBaseModels?.get(name)
+        if (base) {
+          // 真正切回原模型，而不只是删掉记录
+          const result = await switchMemberModel(mission, agent, name, base.provider, base.model)
+          if (!result.ok) return { ok: false, error: result.error }
+          mission.workerBaseModels.delete(name)
+          mission.workerModels?.delete(name)
+          return { ok: true, model: result.selected }
+        }
+        // 没有记录原模型：无法保证切回，明确报错而不是假装成功
+        mission.workerModels?.delete(name)
+        return { ok: false, error: '没有记录该成员的原始模型，无法安全回退（可显式指定 provider/model 切回）' }
       }
       const provider = String(args.provider ?? config.imageProvider ?? '').trim()
       const model = String(args.model ?? config.imageModel ?? '').trim()
@@ -1039,15 +1316,6 @@ export function apply(ctx, rawConfig) {
                   type: 'array',
                   items: { type: 'string' },
                 },
-                currentTasks: {
-                  type: 'array',
-                  items: { type: 'string' },
-                },
-                completedTasks: {
-                  type: 'array',
-                  items: { type: 'string' },
-                },
-                recentNote: { type: 'string' },
               },
               required: ['name', 'status', 'tokens', 'contextWindow', 'ratio', 'activeTasks'],
             },
@@ -1060,15 +1328,12 @@ export function apply(ctx, rawConfig) {
       render: (_args, value) => {
         if (!value.active) return [textBlock('No mission declared on this session.')]
         const rows = value.teammates
-          .map((m) => {
-            const head = `- ${m.name} [${m.status}] ${m.tokens}/${m.contextWindow} tokens (${Math.round(
-              m.ratio * 100,
-            )}%)`
-            const cur = m.currentTasks?.length ? `当前任务: ${m.currentTasks.join('；')}` : ''
-            const done = m.completedTasks?.length ? `已完成任务: ${m.completedTasks.join('；')}` : ''
-            const note = m.recentNote ? `最近进展: ${m.recentNote}` : ''
-            return [head, cur, done, note].filter(Boolean).join('\n  ')
-          })
+          .map(
+            (m) =>
+              `- ${m.name} [${m.status}] ${m.tokens}/${m.contextWindow} tokens (${Math.round(
+                m.ratio * 100,
+              )}%)${m.activeTasks.length ? ` — ${m.activeTasks.join('; ')}` : ''}`,
+          )
           .join('\n')
         return [textBlock(`Mission: ${value.task}\nCap: ${value.cap}\n${rows || '(no teammates yet)'}`)]
       },
@@ -1096,40 +1361,104 @@ export function apply(ctx, rawConfig) {
 
   ctx.tools.register({
     name: 'mission_stop',
-    description: 'End the mission on this session: clears the cap and stops the sentinel relay for it.',
+    description:
+      'End the mission on this session: stop every active teammate, archive their sessions, clean up ' +
+      'temporary files, then clear the mission state. Use it instead of silently dropping the mission, ' +
+      'so no worker is left running and the dashboard disappears consistently.',
     parameters: { type: 'object', properties: {} },
     output: {
       schema: {
         type: 'object',
         additionalProperties: false,
-        properties: { ok: { type: 'boolean' } },
-        required: ['ok'],
+        properties: {
+          ok: { type: 'boolean' },
+          interrupted: { type: 'array', items: { type: 'string' } },
+          archived: { type: 'array', items: { type: 'string' } },
+          removedTempFiles: { type: 'integer' },
+          retiredWorkers: { type: 'integer' },
+        },
+        required: ['ok', 'interrupted', 'archived', 'removedTempFiles', 'retiredWorkers'],
       },
-      render: () => [textBlock('Mission ended.')],
+      render: (_args, value) => [
+        textBlock(
+          `Mission ended. Stopped ${value.interrupted.length} teammate(s), archived ` +
+            `${value.archived.length}, cleaned ${value.removedTempFiles} temp file(s).`,
+        ),
+      ],
     },
-    execute(_args, exec) {
+    async execute(_args, exec) {
       const agent = exec.agent
       if (!agent) throw new Error('mission_stop requires an owning agent session')
-      missions.delete(String(agent.id))
-      hiveOffNotice.add(String(agent.id))
-      return Promise.resolve({ ok: true })
+      const sessionId = String(agent.id)
+      const mission = missions.get(sessionId)
+      if (!mission) {
+        hiveOffNotice.add(sessionId)
+        return { ok: true, interrupted: [], archived: [], removedTempFiles: 0, retiredWorkers: 0 }
+      }
+
+      const team = services.team()
+      const active = activeMembersOf(mission)
+      const interrupted = []
+      for (const member of active) {
+        if (member.status !== 'running' && member.status !== 'provisioning') continue
+        try {
+          team?.interrupt(agent, member.name)
+          interrupted.push(member.name)
+        } catch {
+          // 成员可能已结束
+        }
+      }
+
+      // 归档活跃成员的会话，避免留下"仍在跑但无人监控"的孤儿
+      const closing = active.map((m) => ({ id: m.id, name: m.name }))
+      const closed = await closeChildSessions(closing)
+      const cleanup = await cleanupTempFiles(workspaceOf(agent))
+      retireMembers(sessionId, active.map((m) => m.name))
+
+      missions.delete(sessionId)
+      hiveOffNotice.add(sessionId)
+      persistState()
+
+      return {
+        ok: true,
+        interrupted,
+        archived: closed.archived,
+        removedTempFiles: (cleanup.deleted ?? []).length,
+        retiredWorkers: active.length,
+      }
     },
     presentCall: () => ({ card: 'generic', title: 'Stop mission', kind: 'other' }),
   })
 
-  // ── 人数上限守卫 ────────────────────────────────────────────────────────────
+  // ── 委派守卫：蜂巢模式未开启时禁止开子会话 + 人数上限 ────────────────────
   ctx.tools.guard((exec) => {
-    if (exec.name !== 'spawn_teammate') return undefined
     const agent = exec.agent
     if (!agent) return undefined
-    const mission = missions.get(String(agent.id))
-    if (!mission) return undefined
-    const running = missionMembers(mission).filter(
-      (m) => m.status === 'running' || m.status === 'provisioning',
-    )
-    if (running.length >= mission.cap) {
-      return `mission-control: 本次任务的上限是 ${mission.cap} 个并发工蜂，已满，拒绝再创建`
+    const sessionId = String(agent.id)
+    const mission = missions.get(sessionId)
+    const hiveOn = Boolean(mission && mission.paused !== true)
+
+    // 1) 团队工蜂：只有在蜂巢模式开启时才允许创建
+    if (exec.name === 'spawn_teammate') {
+      if (config.requireHiveModeForSpawns !== false && !hiveOn) {
+        return 'mission-control: 蜂巢模式未开启，禁止创建子会话。请先在会话标题栏打开蜂巢开关。'
+      }
+      if (!mission) return undefined
+      // 与 mission_scale / 面板同一口径：活跃工蜂（排除已交接/已退休）占名额
+      const active = activeMembersOf(mission)
+      if (active.length >= mission.cap) {
+        return `mission-control: 本次任务的上限是 ${mission.cap} 个并发工蜂，已满，拒绝再创建`
+      }
+      return undefined
     }
+
+    // 2) 平台内置委派（subagent / subagent_fork / workflow）：同样只在蜂巢模式开启时允许
+    if (config.blockDelegationOutsideHive === true
+      && (exec.name === 'subagent' || exec.name === 'subagent_fork' || exec.name === 'workflow')
+      && !hiveOn) {
+      return 'mission-control: 蜂巢模式未开启，禁止开子会话。如需并行工作，请先打开蜂巢开关。'
+    }
+
     return undefined
   })
 
@@ -1291,17 +1620,54 @@ export function apply(ctx, rawConfig) {
     })
   }
 
+  /** 会话是否真实存在：live agent 或磁盘上仍有会话日志目录。 */
+  async function sessionExists(sessionId) {
+    if (!sessionId) return false
+    try {
+      if (services.agents()?.get(String(sessionId))) return true
+    } catch {
+      // 忽略
+    }
+    try {
+      const index = await sessionDirIndex()
+      return index.has(String(sessionId).replace(/^session-/, ''))
+    } catch {
+      return false
+    }
+  }
+
   /**
    * 开关蜂巢模式：开启=进入蜂巢模式（必要时建任务），关闭=暂停。
    * 暂停时子会话继续工作，但主会话消息不再下发给子会话。
    */
-  function setMissionMode(sessionId, options = {}) {
+  async function setMissionMode(sessionId, options = {}) {
     if (!sessionId) return { ok: false, error: 'missing-session' }
-    const enabled = options.enabled !== false
+    // 严格布尔：只接受 true / 'true'，其余（含字符串 "false"）都视为关闭
+    const enabled = options.enabled === true || options.enabled === 'true'
     const workers = Number.isFinite(Number(options.workers))
       ? Math.min(10, Math.max(2, Math.floor(Number(options.workers))))
       : undefined
+    // 会话必须真实存在（live 或磁盘上仍有日志），否则会产生"幽灵任务"
+    if (enabled && !(await sessionExists(sessionId))) {
+      return { ok: false, error: 'session-not-found' }
+    }
     const existing = missions.get(sessionId)
+
+    // 只改人数上限：不动启停状态，也不创建/删除任务
+    if (options.workersOnly === true) {
+      if (existing && workers !== undefined) {
+        existing.cap = workers
+        persistState()
+      }
+      return {
+        ok: true,
+        sessionId,
+        enabled: existing ? existing.paused !== true : false,
+        paused: existing ? existing.paused === true : false,
+        cap: existing ? existing.cap : (workers ?? (Number(config.defaultCap) || 3)),
+        active: Boolean(existing),
+      }
+    }
 
     if (enabled) {
       hiveOffNotice.delete(sessionId)
@@ -1320,6 +1686,7 @@ export function apply(ctx, rawConfig) {
           baselineTasks: new Set(agent ? tasksOf(agent).map((t) => t.id) : []),
           handoffInFlight: new Set(),
           handoffRounds: new Map(),
+          handedOff: new Set(),
         })
       }
     } else if (existing) {
@@ -1333,6 +1700,7 @@ export function apply(ctx, rawConfig) {
     }
 
     const mission = missions.get(sessionId)
+    persistState()
     return {
       ok: true,
       sessionId,
@@ -1531,6 +1899,9 @@ export function apply(ctx, rawConfig) {
       }
       for (const event of events) {
         if (event.type !== 'tool/call') continue
+        // 只认「写类」工具：read/grep/session_* 等读操作打开过的文件不算产出
+        const toolName = String(event.data?.name ?? '')
+        if (!WRITE_TOOLS.has(toolName)) continue
         const rawArgs = event.data?.arguments
         let parsed
         try {
@@ -1638,34 +2009,13 @@ export function apply(ctx, rawConfig) {
 
     let removedLogs = 0
     if (config.deleteSessionLogs === true) {
-      const home = process.env.DSH_HOME || join(process.env.USERPROFILE || '', '.dsh')
-      const dir = join(home, 'sessions')
-      const ids = new Set((members ?? []).map((m) => String(m.id)))
-      const walk = async (current, depth) => {
-        if (depth > 3) return
-        let entries
-        try {
-          entries = await readdir(current, { withFileTypes: true })
-        } catch {
-          return
-        }
-        for (const entry of entries) {
-          const full = join(current, entry.name)
-          if (entry.isDirectory()) {
-            await walk(full, depth + 1)
-            continue
-          }
-          const stem = entry.name.replace(/\.jsonl?$/i, '')
-          if (!ids.has(stem)) continue
-          try {
-            await unlink(full)
-            removedLogs += 1
-          } catch {
-            // 删不掉就保留
-          }
-        }
+      // 真实日志是 <sessions>/<workspace>/<id>/session.v4.jsonl.zstd，
+      // 必须按目录删除；按文件名比对 id 永远匹配不到（旧实现因此恒为 0）
+      for (const member of members ?? []) {
+        const purged = await purgeSessionFiles(String(member.id))
+        removedLogs += purged.logDir
+        for (const error of purged.errors ?? []) failures.push(`${member.name}: ${error}`)
       }
-      await walk(dir, 0)
     }
 
     return { archived, failures, removedLogs }
@@ -1729,17 +2079,18 @@ export function apply(ctx, rawConfig) {
     return map
   }
 
-  /** 彻底删除一个会话的磁盘痕迹：日志目录 + 投影缓存。 */
+  /** 彻底删除一个会话的磁盘痕迹：日志目录 + 投影缓存。失败会记录到 errors。 */
   async function purgeSessionFiles(id) {
-    const result = { logDir: 0, projCache: 0 }
+    const result = { logDir: 0, projCache: 0, errors: [] }
     const index = await sessionDirIndex()
     const dir = index.get(String(id))
     if (dir) {
       try {
         await rm(dir, { recursive: true, force: true })
         result.logDir = 1
-      } catch {
-        // 删不掉就保留，由调用方报告
+      } catch (error) {
+        // 不吞错：调用方据此报告失败，而不是谎报"已彻底删除"
+        result.errors.push(`删除会话日志失败: ${errText(error)}`)
       }
     }
     const proj = join(dshHome(), 'storages', 'session_projcache', 'sessions', `${id}.json`)
@@ -1748,8 +2099,8 @@ export function apply(ctx, rawConfig) {
         await unlink(proj)
         result.projCache = 1
       }
-    } catch {
-      // 忽略
+    } catch (error) {
+      result.errors.push(`删除投影缓存失败: ${errText(error)}`)
     }
     sessionIndexCache = { at: 0, map: new Map() }
     return result
@@ -1831,12 +2182,19 @@ export function apply(ctx, rawConfig) {
           const purged = await purgeSessionFiles(id)
           removedLogs += purged.logDir
           removedCaches += purged.projCache
+          // 真的没删掉就不能报成功
+          if ((purged.errors ?? []).length > 0) {
+            for (const error of purged.errors) errors.push(`${member.name}: ${error}`)
+            if (purged.logDir === 0 && purged.projCache === 0) continue
+          }
           deleted.push({ id, name: member.name, hard: true })
+          retireMembers(sessionId, [String(member.name)])
         } else {
           if (registry && typeof registry.archiveSession === 'function') {
             await registry.archiveSession(member.id, { stopActivity: true })
           }
           deleted.push({ id, name: member.name, hard: false })
+          retireMembers(sessionId, [String(member.name)])
         }
       } catch (error) {
         errors.push(`${member.name}: ${errText(error)}`)
@@ -1908,6 +2266,8 @@ export function apply(ctx, rawConfig) {
         if (registry && typeof registry.archiveSession === 'function') {
           await registry.archiveSession(member.id, { stopActivity: true })
         }
+        // 归档后从活跃名单退休：不再计数、不再接收广播、面板不再显示
+        retireMembers(sessionId, [String(member.name)])
         archived.push({ id: String(member.id), name: member.name })
       } catch (error) {
         errors.push(`${member.name}: ${errText(error)}`)
@@ -1931,6 +2291,9 @@ export function apply(ctx, rawConfig) {
         if (registry && typeof registry.unarchiveSession === 'function') {
           await registry.unarchiveSession(member.id)
         }
+        // 取消归档后重新回到活跃名单
+        const mission = missions.get(String(sessionId))
+        if (mission?.retired) mission.retired.delete(String(member.name))
         restored.push({ id: String(member.id), name: member.name })
       } catch (error) {
         errors.push(`${member.name}: ${errText(error)}`)
@@ -1950,12 +2313,12 @@ export function apply(ctx, rawConfig) {
       if (sessionId && mission.sessionId !== sessionId) continue
       const agent = services.agents()?.get(mission.sessionId)
       const allMembers = teammatesOf(agent)
-      const members = missionMembers(mission)
+      const members = activeMembersOf(mission)
       const root = workspaceOf(agent)
       const boardDone = missionTasks(mission)
         .filter((t) => t.status === 'completed')
         .map((t) => t.subject)
-      const memberReports = members
+      const memberReports = activeMembersOf(mission)
         .map((m) => {
           const report = reports.get(String(m.id)) ?? {}
           const done = [...(report.completed ?? [])]
@@ -1964,12 +2327,14 @@ export function apply(ctx, rawConfig) {
         })
         .filter((r) => r.summary)
       if (agent && team) {
-        // 「结束任务」要停掉所有存活子会话，不只本任务创建的成员；
-        // 已删除/已归档的历史条目一律跳过，避免把它们重新归档成孤儿
+        // 「结束任务」只处理仍然活跃的工蜂：已交接/已退休/已删除的历史条目一律跳过，
+        // 避免把它们重新归档成孤儿，也避免重复 interrupt
+        const activeNames = new Set(activeMembersOf(mission).map((m) => m.name))
         const live = await liveMembers(agent)
         const liveNames = new Set(live.map((m) => m.name))
         for (const member of allMembers) {
           if (!liveNames.has(member.name)) continue
+          if (!activeNames.has(member.name)) continue
           closing.push(member)
           if (member.status !== 'running' && member.status !== 'provisioning') continue
           try {
@@ -1979,10 +2344,12 @@ export function apply(ctx, rawConfig) {
             // 成员可能已结束
           }
         }
+        retireMembers(mission.sessionId, [...activeNames])
       }
       missions.delete(mission.sessionId)
       // 任务已结束：让后续轮次明确回到普通会话，压掉历史里的旧分派契约
       hiveOffNotice.add(String(mission.sessionId))
+      persistState()
       stopped.push(mission.sessionId)
       finishing.push({ mission, members, boardDone, memberReports, root })
     }
@@ -2059,18 +2426,29 @@ export function apply(ctx, rawConfig) {
             const chunks = []
             req.on('data', (chunk) => chunks.push(chunk))
             req.on('end', () => {
-              let sessionId
-              let cleanup
+              let body
               try {
                 const raw = Buffer.concat(chunks).toString('utf8')
-                if (raw) {
-                  const body = JSON.parse(raw)
-                  if (body && typeof body.sessionId === 'string') sessionId = body.sessionId
-                  if (body && typeof body.cleanup === 'boolean') cleanup = body.cleanup
+                if (Buffer.byteLength(raw, 'utf8') > MAX_BODY_BYTES) {
+                  send(413, { ok: false, error: 'body-too-large' })
+                  return
                 }
+                body = raw ? JSON.parse(raw) : {}
               } catch {
-                // 无法解析的请求体按「结束全部」处理
+                send(400, { ok: false, error: 'invalid-json' })
+                return
               }
+              // 必须显式指定会话：缺失时绝不退化为「结束全部」
+              const sessionId = body && typeof body.sessionId === 'string' ? body.sessionId.trim() : ''
+              if (!sessionId) {
+                send(400, { ok: false, error: 'missing-sessionId', message: '必须指定 sessionId，不会结束全部会话' })
+                return
+              }
+              if (!missions.has(sessionId)) {
+                send(404, { ok: false, error: 'no-active-mission', sessionId })
+                return
+              }
+              const cleanup = body && typeof body.cleanup === 'boolean' ? body.cleanup : undefined
               endMissions(sessionId, { cleanup })
                 .then((result) => send(200, result))
                 .catch((error) =>
@@ -2125,16 +2503,25 @@ export function apply(ctx, rawConfig) {
             const chunks = []
             req.on('data', (chunk) => chunks.push(chunk))
             req.on('end', () => {
+              let body
               try {
                 const raw = Buffer.concat(chunks).toString('utf8')
-                const body = raw ? JSON.parse(raw) : {}
-                send(200, setMissionMode(body.sessionId, body))
-              } catch (error) {
-                send(400, {
-                  ok: false,
-                  error: String(error && error.message ? error.message : error),
-                })
+                if (Buffer.byteLength(raw, 'utf8') > MAX_BODY_BYTES) {
+                  send(413, { ok: false, error: 'body-too-large' })
+                  return
+                }
+                body = raw ? JSON.parse(raw) : {}
+              } catch {
+                send(400, { ok: false, error: 'invalid-json' })
+                return
               }
+              if (!body || typeof body.sessionId !== 'string' || !body.sessionId.trim()) {
+                send(400, { ok: false, error: 'missing-sessionId' })
+                return
+              }
+              setMissionMode(body.sessionId.trim(), body)
+                .then((result) => send(result.ok ? 200 : 404, result))
+                .catch((error) => send(500, { ok: false, error: errText(error) }))
             })
             req.on('error', () => send(400, { ok: false, error: 'request-error' }))
           },
@@ -2272,7 +2659,8 @@ export function apply(ctx, rawConfig) {
       for (const mission of missions.values()) {
         const agent = services.agents()?.get(mission.sessionId)
         if (!agent) continue
-        for (const member of missionMembers(mission)) {
+        // 只对活跃工蜂做哨兵检测：已交接/已退休的成员不再触发（否则会反复 spawn 续任者）
+        for (const member of activeMembersOf(mission)) {
           const usage = measureMember(member)
           if (usage.known && usage.ratio >= config.handoffRatio) {
             void handoff(mission, agent, member)
@@ -2281,5 +2669,13 @@ export function apply(ctx, rawConfig) {
       }
     }, Math.max(2000, Number(config.pollIntervalMs) || 15000))
     return () => clearInterval(timer)
+  })
+
+  // ── 恢复持久化状态 + 主会话重新上线时对账 ────────────────────────────────
+  void loadPersistedState()
+  ctx.on('agent/created', ({ agent }) => {
+    const mission = agent ? missions.get(String(agent.id)) : undefined
+    if (!mission) return
+    void reconcileMission(mission).then(() => persistState())
   })
 }
