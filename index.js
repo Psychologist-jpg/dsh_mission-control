@@ -144,6 +144,15 @@ export function apply(ctx, rawConfig) {
     const arr = (value) => (value instanceof Set ? [...value] : [])
     const entries = (value) =>
       value instanceof Map ? [...value.entries()] : []
+    // 成员 id 落盘：任务被丢弃时可据此归档孤儿子会话
+    const memberIds = missionMembers(mission).map((m) => [String(m.name), String(m.id)])
+    // 该任务的工蜂自报汇报（reports 以成员 sessionId 为键）
+    const memberReports = missionMembers(mission)
+      .map((m) => {
+        const report = reports.get(String(m.id))
+        return report ? [String(m.id), report] : undefined
+      })
+      .filter(Boolean)
     return {
       sessionId: mission.sessionId,
       task: mission.task,
@@ -159,6 +168,8 @@ export function apply(ctx, rawConfig) {
       handoffChainRounds: entries(mission.handoffChainRounds),
       workerModels: entries(mission.workerModels),
       workerBaseModels: entries(mission.workerBaseModels),
+      memberIds,
+      memberReports,
       lastHandoff: mission.lastHandoff ?? null,
       lastError: mission.lastError ?? null,
       updatedAt: Date.now(),
@@ -266,18 +277,51 @@ export function apply(ctx, rawConfig) {
       const raw = JSON.parse(readFileSync(file, 'utf8'))
       const list = Array.isArray(raw?.missions) ? raw.missions : []
       const index = await sessionDirIndex()
+      const keptIds = new Set()
       let loaded = 0
       for (const item of list) {
         const sid = String(item?.sessionId ?? '')
         if (!sid) continue
         const updatedAt = Number(item.updatedAt) || 0
-        if (updatedAt && Date.now() - updatedAt > STATE_TTL_MS) continue
+        const expired = updatedAt > 0 && Date.now() - updatedAt > STATE_TTL_MS
         // 主会话必须仍然存在（live 或磁盘有日志），否则丢弃
         const exists = services.agents()?.get(sid) || index.has(sid.replace(/^session-/, ''))
-        if (!exists) continue
+        if (expired || !exists) {
+          // 丢弃任务时归档它的孤儿子会话，避免会话还在却无人监控
+          for (const pair of Array.isArray(item?.memberIds) ? item.memberIds : []) {
+            const id = Array.isArray(pair) ? String(pair[1] ?? '') : ''
+            if (!id || !index.has(id)) continue
+            try {
+              const registry = ctx.get('workspaceRegistry')
+              await registry?.archiveSession?.(id, { stopActivity: true })
+            } catch {
+              // 归档失败不阻塞启动
+            }
+          }
+          archivedCache = { at: 0, ids: new Set() }
+          continue
+        }
         missions.set(sid, deserializeMission(item))
         loaded += 1
+        for (const pair of Array.isArray(item?.memberIds) ? item.memberIds : []) {
+          const id = Array.isArray(pair) ? String(pair[1] ?? '') : ''
+          if (id) keptIds.add(id)
+        }
+        // 恢复工蜂自报汇报（否则重载后面板摘要与结束汇总都会缺数据）
+        for (const pair of Array.isArray(item?.memberReports) ? item.memberReports : []) {
+          if (!Array.isArray(pair)) continue
+          const id = String(pair[0] ?? '')
+          const report = pair[1]
+          if (!id || !report || typeof report !== 'object') continue
+          reports.set(id, {
+            current: typeof report.current === 'string' ? report.current : '',
+            completed: Array.isArray(report.completed) ? report.completed.map(String).slice(-8) : [],
+          })
+        }
       }
+      // 丢弃不属于任何存活任务的聚合/测量缓存
+      pruneCaches(keptIds)
+
       for (const mission of [...missions.values()]) {
         await reconcileMission(mission, index)
       }
@@ -647,6 +691,29 @@ export function apply(ctx, rawConfig) {
 
   function invalidateSnapshot() {
     snapshotCache = { at: 0, data: null }
+  }
+
+  /**
+   * 回收不属于任何存活任务的聚合/测量缓存。
+   * 否则长驻 Host 会为"见过的每个工蜂会话"保留条目，缓慢累积。
+   */
+  function pruneCaches(keepIds) {
+    const keep = keepIds ?? new Set()
+    for (const id of [...sessionAgg.keys()]) {
+      if (!keep.has(String(id))) sessionAgg.delete(id)
+    }
+    for (const id of [...measureCache.keys()]) {
+      if (!keep.has(String(id))) measureCache.delete(id)
+    }
+  }
+
+  /** 当前所有存活任务的成员 id 集合（用于缓存回收）。 */
+  function liveMemberIds() {
+    const ids = new Set()
+    for (const mission of missions.values()) {
+      for (const member of missionMembers(mission)) ids.add(String(member.id))
+    }
+    return ids
   }
 
   async function cachedDashboardSnapshot() {
@@ -1357,8 +1424,8 @@ export function apply(ctx, rawConfig) {
         if (next.completed.length > 8) next.completed = next.completed.slice(-8)
       }
       reports.set(key, next)
-      // 汇报内容变化后让面板快照即时刷新
-      invalidateSnapshot()
+      // 汇报内容变化：立即刷新面板并落盘（否则重载后摘要与结束汇总都会缺数据）
+      persistState()
       return Promise.resolve({ ok: true })
     },
     presentCall: (args) => ({
@@ -1496,10 +1563,17 @@ export function apply(ctx, rawConfig) {
       const closed = await closeChildSessions(closing)
       const cleanup = await cleanupTempFiles(workspaceOf(agent))
       retireMembers(sessionId, active.map((m) => m.name))
+      // 清掉本任务成员的汇报与缓存
+      for (const member of active) {
+        reports.delete(String(member.id))
+        sessionAgg.delete(String(member.id))
+        measureCache.delete(String(member.id))
+      }
 
       missions.delete(sessionId)
       hiveOffNotice.add(sessionId)
       persistState()
+      pruneCaches(liveMemberIds())
 
       return {
         ok: true,
@@ -1559,6 +1633,8 @@ export function apply(ctx, rawConfig) {
     if (!mission.paused && !mission.taskAt && !text.startsWith('【蜂巢任务已结束】')) {
       mission.task = text.slice(0, 1000)
       mission.taskAt = Date.now()
+      // 任务文本必须落盘：否则重载后会退回占位符，且下一条消息被重新当成任务目标
+      persistState()
     }
 
     broadcast(mission, text)
@@ -2431,10 +2507,18 @@ export function apply(ctx, rawConfig) {
       missions.delete(mission.sessionId)
       // 任务已结束：让后续轮次明确回到普通会话，压掉历史里的旧分派契约
       hiveOffNotice.add(String(mission.sessionId))
+      // 清掉该任务成员的汇报与缓存，避免长期累积
+      for (const member of members) {
+        reports.delete(String(member.id))
+        sessionAgg.delete(String(member.id))
+        measureCache.delete(String(member.id))
+      }
       persistState()
       stopped.push(mission.sessionId)
       finishing.push({ mission, members, boardDone, memberReports, root })
     }
+    // 收尾后再统一回收一次（只保留仍在运行的其它任务成员）
+    pruneCaches(liveMemberIds())
 
     let cleanup = { deleted: [], errors: [], root: undefined }
     if (options.cleanup !== false) {
