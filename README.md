@@ -33,31 +33,35 @@ Mission Control 让一个 Lead 会话把多个工蜂组织成一场「任务（M
    - `mission_scale` 内部同样走这套口径，不会出现 `spawn` 与 `scale` 两套标准。
 
 2. **统一的活跃工蜂口径（Active Members）**
+   队友的**唯一来源是平台的 subagent 树**：`refreshMembers()` 调 `subagents.listDescendants()` 把成员刷新进任务级缓存 `mission.members`（成员 id → 名称/label），其余同步逻辑（守卫、面板、广播、收尾）都读这份缓存；任务状态落盘时会一并保存，重启后可恢复。
    `activeMembersOf()` = 任务成员 − 已交接（`handedOff`）− 已退休（`retired`：归档/删除/交接过的成员）。**计数、上限判定、面板显示、广播、哨兵、结束收尾全部只认这一份名单**，避免出现「4/2 越界计数」「给已归档成员反复广播」「哨兵对已交接成员反复开续任者」等问题。归档/删除/交接动作都会立即把成员标记退休。
 
-3. **上下文哨兵与自动交接（Context Sentinel & Handoff）**
+3. **平台 Team 模式联动（Team Mode）**
+   任务开启时自动调用 `agentTeams.setEnabled(lead, true)`，让共享任务板相关工具对模型可见；任务结束（`mission_stop` / `/mission-end-v1` / 悬浮窗「结束任务」）时再关闭，避免任务结束后仍残留任务板上下文。
+
+4. **上下文哨兵与自动交接（Context Sentinel & Handoff）**
    哨兵按 `pollIntervalMs` 定时用 `tokenMeter` 测量每个**活跃**工蜂的上下文占用（分母取会话的 `contextWindow`，取不到时退回 `fallbackContextWindow`）。比例达到 `handoffRatio` 时：
    - 中断该成员，并把它标记为已交接 / 退休（让出活跃名额）；
    - 生成一份交接摘要（任务目标、任务板现状、前任最近 4 条进展记录、续任职责）；
    - 以 `fresh` 上下文新建续任者 `<name>-rN`，接手原成员未完成的工作；
    - **同一条链有代数上限** `maxHandoffRounds`（默认 3，按链根名 `-rN` 去重统计），阈值配置异常时也不会无限 spawn；同一成员只交接一次，失败也不会每轮重试造成风暴。
 
-4. **状态持久化与重启恢复（Persistence）**
+5. **状态持久化与重启恢复（Persistence）**
    任务状态（目标、上限、暂停态、基线、交接链、模型记录、**成员 id 映射**、**工蜂自报汇报**等）会去抖写盘到 `$DSH_HOME/storages/mission-control/missions.json`。客户端重启/插件重载后自动恢复任务，并按磁盘会话目录与花名册**对账**：
    - 已删除/已归档的成员移入 `retired`，花名册里已不存在的名字从记录中剔除；
    - **超过 7 天或主会话已不存在的任务会被丢弃，同时归档它的孤儿子会话**（避免「会话还在跑却无人监控」）；
    - 恢复成员汇报，重载后面板摘要与结束汇总不会缺数据；
    - 丢弃任务后回收不属于存活任务的聚合/测量缓存（长驻 Host 不会为「见过的每个会话」保留条目）。任务目标一经捕获即落盘，重载后不会退回占位符、也不会把下一条消息误当新目标。
 
-5. **驾驶舱广播（Cockpit Broadcast）**
+6. **驾驶舱广播（Cockpit Broadcast）**
    任务进行中，人类在本会话发出的 `user/message` 会被立即包装成 `[驾驶舱广播] ...` 扇出给当前任务的活跃工蜂，不必等 Lead 跑一轮模型再转述。**暂停时不下发**，但子会话仍继续工作。发送前会再按磁盘存活过滤一遍，已删除/已归档的条目不会收到消息。
 
-6. **任务拆解与人数配平（Mission Scale）**
+7. **任务拆解与人数配平（Mission Scale）**
    `missionScale()` 从任务板实时推算配平统计：待办/进行中的子任务数、未认领数、**活跃**工蜂数、上限，以及「目标人数 = min(待认领子任务数, 上限)」与缺口 `gap`。这份统计会：
    - 通过 `/mission-dashboard-v2.json` 的 `scale` 字段输出，悬浮窗标题栏显示 `${workers}/${cap} 工蜂 · 待办 N · 建议再开 M`；
    - 驱动提示词：Lead 侧注入「先 `mission_start` → 建任务板 → 算人数 → `mission_scale` 一次开齐 → 自己只做协调验收」的分派契约；若已收到任务但工蜂不足，则改为强制催办「现在必须再开 N 个」；子会话侧则注入「只做分配的活 + 汇报」的身份约束。
 
-7. **蜂巢模式开关与子会话管理（Hive Mode）**
+8. **蜂巢模式开关与子会话管理（Hive Mode）**
    会话头部注入一个开关（`普通 / 蜂巢 / 已暂停`）+ 人数上限选择（2–10）+ 「子会话」管理弹窗：
    - 开启：建任务（或恢复暂停），主会话消息开始下发；
    - 关闭（暂停）：子会话继续工作，但主会话消息不再下发给子会话；
@@ -66,14 +70,14 @@ Mission Control 让一个 Lead 会话把多个工蜂组织成一场「任务（M
      - **彻底删除**：停止 → 解除归档 → 删除磁盘上的会话日志目录与投影缓存（不可恢复），已删除条目变灰不可再选。
    - 花名册里会长期残留历史条目（平台无移除成员 API），因此「广播 / 结束归档 / 计数」都会先经 `liveMembers()` 过滤；`mission_scale` 生成的名字也会对**整份花名册**（含历史条目）去重，冲突时自动加 `-2`、`-3` 后缀。
 
-8. **生图模型策略（Image Model Policy）**
+9. **生图模型策略（Image Model Policy）**
    图像模型不支持 chat 协议（直接切会话模型会 404），因此插件把「生图」做成工具能力而非模型切换：
    - `mission_image` 直接调用配置的图像接口（默认 `qwen-image-2.1`，OpenAI 兼容 `/images/generations`，`response_format: b64_json`），把图片落盘到工作区，路径限制在工作目录内；
    - API key 优先从 DSH 凭据库取（`imageApiKeyRef`），取不到再回退同名环境变量；
    - `mission_scale` 支持按子任务文本命中生图关键词（`imageKeywords`）或显式 `image: true` 自动切到图像模型，也可用 `provider` / `model` 覆盖；`mission_set_model` 可事后切换或 `revert` 回默认；
    - 该自动切换受 `imageModelSwitch` 开关控制，**默认关闭**（守住「图像模型不能对话」这条线，只提供 `mission_image` 工具）。
 
-9. **实时进度悬浮窗（Dashboard）**
+10. **实时进度悬浮窗（Dashboard）**
    `dashboard.js` 在 Web 客户端注入悬浮层（`shell.overlay`），每 2 秒轮询 `/mission-dashboard-v2.json`，**每个主会话渲染一个独立悬浮窗**：   - 可拖动、可折叠，位置与折叠状态按会话分别保存在 `localStorage`，多窗口默认错开不重叠；
    - 标题显示会话标题（来自 `sessionTitle` 服务，取不到则回退「会话 <id 尾号>」）；
    - 显示配平统计（现有/上限工蜂、待办数、建议再开数）、工蜂状态徽标、上下文占用进度条（绿 → 黄 → 红）、当前任务、已完成任务、产出文件、**当前模型**（优先取实际使用的模型，其次策略指定值）、暂停状态；
@@ -103,16 +107,18 @@ Mission Control 让一个 Lead 会话把多个工蜂组织成一场「任务（M
 
 ## 安装与启用
 
-本插件以 **profile 本地链接（link）** 方式安装，不依赖 npm 发包。它**强依赖** DSH 实验性智能体团队插件，安装前需先准备好该依赖。
+本插件以 **profile 本地链接（link）** 方式安装，不依赖 npm 发包。它**强依赖** DSH 的 Agent Teams 插件，安装前需先准备好该依赖。
 
 ### 前置依赖
 
 本插件在 `package.json` 的 `peerDependencies` 中声明了：
 
-- `@deepseek-ai/dsh-experimental-agent-team`（提供 `agentTeams` 服务，必需）
+- `@deepseek-ai/dsh-agent-team`（`>=0.2.2-rc.3 <0.3.0`，提供 `agentTeams` 与 `subagents` 服务，必需）
 - `@deepseek-ai/cordis`（DSH 宿主底座）
 
-由于采用 `link:` 安装时包管理器不会自动补装 peer 依赖，请显式把聚合包 `@deepseek-ai/dsh-experimental-agent-team-profile`（内含核心 + 工具 + 客户端 UI）加入 profile 的 `dependencies` 与 `bundles`。
+> **版本说明**：0.2.2-rc.3 起 Agent Teams 把队友统一为**标准 subagent 树**（不再有独立 roster），核心包也更名为 `@deepseek-ai/dsh-agent-team`。本插件 2.x 依赖这一新 API（`subagents.startActivation` / `subagents.sendMessage` / `subagents.interrupt` / `agentTeams.setEnabled` + 任务板），**不再兼容** 0.2.2-rc.1 及更早的 `@deepseek-ai/dsh-experimental-agent-team`。使用旧版请安装本仓库的 `v1.7.1`。
+
+由于采用 `link:` 安装时包管理器不会自动补装 peer 依赖，请显式把提供 `agentTeams` + `subagents` 的 Agent Teams 聚合 bundle（客户端 UI + 任务板工具 + 核心服务）加入 profile 的 `dependencies` 与 `bundles`。
 
 ### 步骤
 
@@ -127,14 +133,15 @@ Mission Control 让一个 Lead 会话把多个工蜂组织成一场「任务（M
    ```jsonc
    {
      "dependencies": {
-       "@deepseek-ai/dsh-experimental-agent-team-profile": "0.2.2-rc.1",
+       // Agent Teams 聚合 bundle（名字随发行版可能不同，请以实际包名为准）
+       "@deepseek-ai/dsh-agent-team": "0.2.2-rc.3",
        "@local/mission-control": "link:C:/path/to/mission-control"
      },
      "dsh": {
        "profile": {
          "bundles": [
            // ... 其他官方 bundle
-           "@deepseek-ai/dsh-experimental-agent-team-profile",
+           "@deepseek-ai/dsh-agent-team",
            "@local/mission-control"
          ]
        }
@@ -146,7 +153,7 @@ Mission Control 让一个 Lead 会话把多个工蜂组织成一场「任务（M
 
 4. 启动新会话后，会话头部出现蜂巢模式开关，页面右下角出现「蜂巢任务」悬浮窗，`mission_start` / `mission_scale` / `mission_report` / `mission_status` / `mission_stop` 五个工具也在工具列表中。
 
-> 依赖 Agent Teams：本插件读取 `agentTeams`（由 `@deepseek-ai/dsh-experimental-agent-team` 提供）、`agents`、`sessions`、`tokenMeter`、`systemPrompt`、`webServer`、`workingDirectory`、`workspaceRegistry`、`sessionController` 等服务；若你的 profile 已由其他 bundle 提供同名服务，可省略上面的 profile 聚合包，但必须保证 `agentTeams` 服务可用。
+> 依赖 Agent Teams：本插件读取 `agentTeams`（任务板与 Team 模式开关）与 `subagents`（队友的创建/消息/中断），以及 `agents`、`sessions`、`tokenMeter`、`systemPrompt`、`webServer`、`workingDirectory`、`workspaceRegistry`、`sessionController` 等服务。若 profile 已由其他 bundle 提供同名服务，可省略上面的聚合包，但必须保证 `agentTeams` 与 `subagents` 都可用。
 
 ---
 

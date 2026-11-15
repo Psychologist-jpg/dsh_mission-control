@@ -169,6 +169,7 @@ export function apply(ctx, rawConfig) {
       workerModels: entries(mission.workerModels),
       workerBaseModels: entries(mission.workerBaseModels),
       memberIds,
+      members: entries(mission.members),
       memberReports,
       lastHandoff: mission.lastHandoff ?? null,
       lastError: mission.lastError ?? null,
@@ -194,6 +195,7 @@ export function apply(ctx, rawConfig) {
       handoffChainRounds: asMap(raw.handoffChainRounds),
       handedOff: asSet(raw.handedOff),
       retired: asSet(raw.retired),
+      members: asMap(raw.members),
       workerModels: asMap(raw.workerModels),
       workerBaseModels: asMap(raw.workerBaseModels),
       lastHandoff: raw.lastHandoff ?? undefined,
@@ -339,18 +341,138 @@ export function apply(ctx, rawConfig) {
 
   const services = {
     team: () => ctx.get('agentTeams'),
+    subagents: () => ctx.get('subagents'),
     agents: () => ctx.get('agents'),
     sessions: () => ctx.get('sessions'),
     meter: () => ctx.get('tokenMeter'),
   }
 
-  function teammatesOf(agent) {
-    const team = services.team()
-    if (!team || !agent) return []
+  /**
+   * 0.2.2-rc.3 起，队友是标准 subagent 树的成员（没有独立 roster）。
+   * 这里维护一份任务级成员缓存：由 refreshMembers() 从 subagents.listDescendants 刷新，
+   * 其余同步代码（守卫、面板、广播、收尾）都读这份缓存。
+   */
+  function missionMembersOf(sessionId) {
+    const mission = missions.get(String(sessionId))
+    if (!mission) return []
+    const out = []
+    for (const [id, info] of mission.members ?? []) {
+      const live = services.agents()?.get(String(id))
+      out.push({
+        id: String(id),
+        name: String(info?.name ?? id),
+        description: String(info?.label ?? ''),
+        status: live?.status ?? 'inactive',
+      })
+    }
+    return out
+  }
+
+  /** 用 subagent 树刷新任务成员缓存（异步；失败时保留旧缓存）。 */
+  async function refreshMembers(mission) {
+    const subs = services.subagents()
+    if (!subs || !mission) return mission?.members ?? new Map()
+    mission.members = mission.members ?? new Map()
+    let rows
     try {
-      return team.listMembers(agent).filter((m) => m.role === 'teammate')
+      rows = await subs.listDescendants(mission.sessionId)
     } catch {
-      return []
+      return mission.members
+    }
+    const seen = new Set()
+    const baseline = mission.baseline ?? new Set()
+    for (const row of rows ?? []) {
+      if (!row || row.kind !== 'child' || !row.id) continue
+      const id = String(row.id)
+      const name = String(row.path || row.name || row.label || id)
+      if (baseline.has(name)) continue
+      mission.members.set(id, { name, label: row.label ?? '' })
+      seen.add(id)
+    }
+    // 只保留仍在树里的成员
+    for (const id of [...mission.members.keys()]) {
+      if (!seen.has(id)) mission.members.delete(id)
+    }
+    return mission.members
+  }
+
+  function teammatesOf(agent) {
+    return agent ? missionMembersOf(String(agent.id)) : []
+  }
+
+  /** 该会话是否属于某个任务的成员（用于区分 Lead 与 teammate 提示）。 */
+  function isMissionMember(sessionId) {
+    const id = String(sessionId)
+    for (const mission of missions.values()) {
+      if (mission.members?.has(id)) return true
+    }
+    return false
+  }
+
+  /**
+   * 创建一个队友：0.2.2-rc.3 用标准 subagent 激活，而不是 agentTeams.spawnTeammate。
+   * 返回 activation（含 childId 与 result Promise）。
+   */
+  async function spawnChild(mission, lead, options) {
+    const subs = services.subagents()
+    if (!subs || typeof subs.startActivation !== 'function') {
+      throw new Error('subagents 服务不可用')
+    }
+    const name = String(options?.name ?? '').trim()
+    const task = String(options?.task ?? '').trim()
+    if (!name || !task) throw new Error('name 与 task 不能为空')
+    const activation = await subs.startActivation({
+      provider: String(config.freshProvider || 'spawn'),
+      label: name,
+      name,
+      prompt: [textBlock(task)],
+      parent: lead,
+      signal: new AbortController().signal,
+      delivery: 'parent',
+    })
+    mission.members = mission.members ?? new Map()
+    mission.members.set(String(activation.childId), {
+      name: String(activation.name || name),
+      label: name,
+    })
+    persistState()
+    return activation
+  }
+
+  /** 向队友投递消息（steer/唤醒），替代 agentTeams.sendMessage。 */
+  async function sendToMember(lead, targetId, text) {
+    const subs = services.subagents()
+    if (!subs || typeof subs.sendMessage !== 'function') return false
+    try {
+      await subs.sendMessage(lead, String(targetId), [textBlock(text)], {
+        signal: new AbortController().signal,
+      })
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  /** 中断队友当前轮次，替代 agentTeams.interrupt。 */
+  function interruptMember(lead, targetId) {
+    const subs = services.subagents()
+    if (!subs || typeof subs.interrupt !== 'function') return false
+    try {
+      subs.interrupt(String(targetId), { kind: 'ancestor', agent: lead })
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  /** 开关平台 Team 模式，使任务板工具与我的任务状态保持一致。 */
+  async function setTeamMode(lead, enabled) {
+    const team = services.team()
+    if (!team || typeof team.setEnabled !== 'function') return
+    try {
+      await team.setEnabled(lead, Boolean(enabled))
+    } catch {
+      // 平台不支持时忽略：任务板工具将不可用，但插件自身仍可运行
     }
   }
 
@@ -926,20 +1048,12 @@ export function apply(ctx, rawConfig) {
         return
       }
       const digest = buildDigest(mission, agent, member)
-      try {
-        team.interrupt(agent, name)
-      } catch {
-        // 可能已经处于 inactive，忽略
-      }
+      interruptMember(agent, member.id)
       const round = (mission.handoffRounds.get(name) ?? 0) + 1
       mission.handoffRounds.set(name, round)
-      await team.spawnTeammate(agent, {
+      await spawnChild(mission, agent, {
         name: `${name}-r${round}`,
-        description: `接替 ${name}（上下文交接）`,
-        prompt: [textBlock(digest)],
-        context: 'fresh',
-        provider: config.freshProvider,
-        signal: new AbortController().signal,
+        task: digest,
       })
       // 标记已交接：哨兵与广播都不再把它当作可继续工作的成员
       mission.handedOff?.add(name)
@@ -978,23 +1092,14 @@ export function apply(ctx, rawConfig) {
     if (members.length === 0) return 0
     const signal = new AbortController().signal
     let sent = 0
-    // 再按磁盘存活过滤：花名册里的已删除/已归档条目不再接收广播
+    // 只投递给磁盘上仍存活的队友
     void liveMembers(agent).then((live) => {
       const liveNames = new Set(live.map((m) => m.name))
       for (const member of members) {
         if (!liveNames.has(member.name)) continue
-        try {
-          team
-            .sendMessage(agent, {
-              target: member.name,
-              content: [textBlock(`[驾驶舱广播] ${text}`)],
-              signal,
-            })
-            .catch(() => {})
-          sent += 1
-        } catch {
-          // 单个成员失败不影响其他成员
-        }
+        void sendToMember(agent, member.id, `[驾驶舱广播] ${text}`).then((ok) => {
+          if (ok) sent += 1
+        })
       }
       mission.relayed = (mission.relayed ?? 0) + 1
     })
@@ -1065,9 +1170,13 @@ export function apply(ctx, rawConfig) {
           handoffInFlight: new Set(),
           handoffRounds: new Map(),
           handedOff: new Set(),
+          members: new Map(),
         })
       }
       persistState()
+      // 开启平台 Team 模式（任务板工具对模型可见）并刷新成员缓存
+      void setTeamMode(agent, true)
+      void refreshMembers(missions.get(key)).then(() => persistState())
       return Promise.resolve({
         ok: true,
         workers: Number(args.workers),
@@ -1203,14 +1312,7 @@ export function apply(ctx, rawConfig) {
           continue
         }
         try {
-          await team.spawnTeammate(agent, {
-            name,
-            description: task.slice(0, 60),
-            prompt: [textBlock(task)],
-            context: 'fresh',
-            provider: config.freshProvider,
-            signal,
-          })
+          await spawnChild(mission, agent, { name, task })
           existing.add(name)
           rosterNames.add(name)
           spawned.push(name)
@@ -1545,23 +1647,20 @@ export function apply(ctx, rawConfig) {
         return { ok: true, interrupted: [], archived: [], removedTempFiles: 0, retiredWorkers: 0 }
       }
 
-      const team = services.team()
+      await refreshMembers(mission)
       const active = activeMembersOf(mission)
       const interrupted = []
       for (const member of active) {
         if (member.status !== 'running' && member.status !== 'provisioning') continue
-        try {
-          team?.interrupt(agent, member.name)
-          interrupted.push(member.name)
-        } catch {
-          // 成员可能已结束
-        }
+        interruptMember(agent, member.id)
+        interrupted.push(member.name)
       }
 
       // 归档活跃成员的会话，避免留下"仍在跑但无人监控"的孤儿
       const closing = active.map((m) => ({ id: m.id, name: m.name }))
       const closed = await closeChildSessions(closing)
       const cleanup = await cleanupTempFiles(workspaceOf(agent))
+      void setTeamMode(agent, false)
       retireMembers(sessionId, active.map((m) => m.name))
       // 清掉本任务成员的汇报与缓存
       for (const member of active) {
@@ -1667,13 +1766,8 @@ export function apply(ctx, rawConfig) {
 
             // 会话没有蜂巢任务：只对历史 teammate 会话给一点协作提示；其余一律不注入
             if (!mission) {
-              const team = services.team()
-              let role
-              try {
-                role = agent ? team?.membership?.(agent)?.role : undefined
-              } catch {
-                role = undefined
-              }
+              // 0.2.2-rc.3 没有 roster：队友判定改为"是否属于某个任务的成员缓存"
+              const role = agent && isMissionMember(String(agent.id)) ? 'teammate' : 'lead'
               if (role !== 'teammate') {
                 // 曾经是蜂巢帧、现在已回到普通模式：明确纠正历史里的旧指令
                 if (sessionId && hiveOffNotice.has(sessionId)) {
@@ -1829,6 +1923,9 @@ export function apply(ctx, rawConfig) {
 
     if (enabled) {
       hiveOffNotice.delete(sessionId)
+      const leadAgent = services.agents()?.get(sessionId)
+      // 开启平台 Team 模式，让任务板工具对模型可见
+      if (leadAgent) void setTeamMode(leadAgent, true)
       if (existing) {
         existing.paused = false
         if (workers !== undefined) existing.cap = workers
@@ -1845,6 +1942,7 @@ export function apply(ctx, rawConfig) {
           handoffInFlight: new Set(),
           handoffRounds: new Map(),
           handedOff: new Set(),
+          members: new Map(),
         })
       }
     } else if (existing) {
@@ -2268,6 +2366,8 @@ export function apply(ctx, rawConfig) {
   async function listChildSessions(sessionId, options = {}) {
     const agent = sessionId ? services.agents()?.get(String(sessionId)) : undefined
     if (!agent) return { ok: false, error: 'session-not-found', children: [] }
+    const mission = missions.get(String(sessionId))
+    if (mission) await refreshMembers(mission)
     const archivedSet = archivedSessionIds()
     const index = await sessionDirIndex()
     const all = teammatesOf(agent).map((member) => {
@@ -2320,12 +2420,8 @@ export function apply(ctx, rawConfig) {
     for (const member of targets) {
       const id = String(member.id)
       try {
-        if (team && (member.status === 'running' || member.status === 'provisioning')) {
-          try {
-            team.interrupt(agent, member.name)
-          } catch {
-            // 已结束
-          }
+        if (member.status === 'running' || member.status === 'provisioning') {
+          interruptMember(agent, member.id)
         }
 
         if (hard) {
@@ -2414,12 +2510,8 @@ export function apply(ctx, rawConfig) {
           errors.push(`${member.name}: 会话已不存在，已清理归档残留`)
           continue
         }
-        if (team && (member.status === 'running' || member.status === 'provisioning')) {
-          try {
-            team.interrupt(agent, member.name)
-          } catch {
-            // 已结束
-          }
+        if (member.status === 'running' || member.status === 'provisioning') {
+          interruptMember(agent, member.id)
         }
         if (registry && typeof registry.archiveSession === 'function') {
           await registry.archiveSession(member.id, { stopActivity: true })
@@ -2470,6 +2562,8 @@ export function apply(ctx, rawConfig) {
     for (const mission of [...missions.values()]) {
       if (sessionId && mission.sessionId !== sessionId) continue
       const agent = services.agents()?.get(mission.sessionId)
+      // 收尾前先刷新成员缓存，确保中断/归档覆盖到全部子会话
+      await refreshMembers(mission)
       const allMembers = teammatesOf(agent)
       const members = activeMembersOf(mission)
       const root = workspaceOf(agent)
@@ -2495,18 +2589,16 @@ export function apply(ctx, rawConfig) {
           if (!activeNames.has(member.name)) continue
           closing.push(member)
           if (member.status !== 'running' && member.status !== 'provisioning') continue
-          try {
-            team.interrupt(agent, member.name)
-            interrupted.push(member.name)
-          } catch {
-            // 成员可能已结束
-          }
+          interruptMember(agent, member.id)
+          interrupted.push(member.name)
         }
         retireMembers(mission.sessionId, [...activeNames])
       }
       missions.delete(mission.sessionId)
       // 任务已结束：让后续轮次明确回到普通会话，压掉历史里的旧分派契约
       hiveOffNotice.add(String(mission.sessionId))
+      // 关闭平台 Team 模式
+      void setTeamMode(agent, false)
       // 清掉该任务成员的汇报与缓存，避免长期累积
       for (const member of members) {
         reports.delete(String(member.id))
@@ -2919,6 +3011,8 @@ export function apply(ctx, rawConfig) {
       for (const mission of missions.values()) {
         const agent = services.agents()?.get(mission.sessionId)
         if (!agent) continue
+        // 先异步刷新成员缓存（subagent 树是唯一来源）
+        void refreshMembers(mission)
         // 只对活跃工蜂做哨兵检测：已交接/已退休的成员不再触发（否则会反复 spawn 续任者）
         for (const member of activeMembersOf(mission)) {
           const usage = measureMember(member)
