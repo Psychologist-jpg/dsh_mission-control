@@ -8,6 +8,5 @@
         defaultCap: 3
         freshProvider: spawn
         maxHandoffRounds: 3
-        # 方案 A：蜂巢开关是子会话的唯一入口
-        requireHiveModeForSpawns: true
+        # 蜂巢开关是子会话的唯一入口：未开启时拒绝 subagent / subagent_fork / workflow
         blockDelegationOutsideHive: true

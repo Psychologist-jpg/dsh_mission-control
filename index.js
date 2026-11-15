@@ -1,8 +1,8 @@
 /**
  * Mission Control — Agent Teams 的任务驾驶舱补充插件。
  *
- * 补三个官方 Agent Teams 包没有的能力：
- *  1. 任务级人数上限：mission_start 指定 workers，超过上限的 spawn_teammate 被拒绝。
+ * 在官方 Agent Teams（0.2.2-rc.3+，subagent 树模型）之上补：
+ *  1. 任务级人数上限：mission_start 指定 workers，超出上限的委派（mission_scale / subagent）被拒绝。
  *  2. 上下文哨兵：定时用 tokenMeter 测量每个工蜂的上下文压力，超阈值时打断并在新会话里
  *     接续（继承结构化摘要），不依赖任何模型的自我检测。
  *  3. 驾驶舱中继：原初会话里人类发的话，立即扇出给全体工蜂，不等 Lead 跑模型。
@@ -48,10 +48,8 @@ const DEFAULT_CONFIG = {
   imageApiBaseUrl: 'https://api.llm.ustc.edu.cn/v1',
   imageApiKeyRef: 'USTC_API_KEY',
   imageApiSize: '1024x1024',
-  // 未开启蜂巢模式时禁止创建团队工蜂（spawn_teammate）
-  requireHiveModeForSpawns: true,
-  // 未开启蜂巢模式时是否也禁止平台内置的 subagent / subagent_fork / workflow 委派
-  // 方案 A：开关是唯一入口，默认开启（去关闭可恢复平台原生并行能力）
+  // 未开启蜂巢模式时禁止平台委派（subagent / subagent_fork / workflow）。
+  // 方案 A：蜂巢开关是子会话的唯一入口，默认开启（设为 false 可恢复平台原生并行能力）
   blockDelegationOutsideHive: true,
   // 同一条交接链最多续任几代（按链根名统计），防止阈值配置异常时无限 spawn
   maxHandoffRounds: 3,

@@ -28,7 +28,7 @@ Mission Control 让一个 Lead 会话把多个工蜂组织成一场「任务（M
 
 1. **委派守卫与人数上限（Delegation Guard & Workers Cap）**
    所有「开子会话」的入口都由 `ctx.tools.guard` 统一把关：
-   - **未开启蜂巢模式时**，`subagent` / `subagent_fork` / `workflow`（以及旧版的 `spawn_teammate`）一律被拒绝（`blockDelegationOutsideHive`，默认开）—— 蜂巢开关是子会话的唯一入口；
+   - **未开启蜂巢模式时**，`subagent` / `subagent_fork` / `workflow` 一律被拒绝（`blockDelegationOutsideHive`，默认开）—— 蜂巢开关是子会话的唯一入口；
    - **蜂巢模式下**，`subagent` / `subagent_fork` 会被要求改用 `mission_scale`（`forceMissionScaleDelegation`，默认开），否则会绕过上限、不进面板、结束时不被归档；
    - **并发上限只数「正在运行」的成员**（`running` / `provisioning`）：`continuable` 子代理完成后不会消失，若按累计成员计数，上限会退化成总值、之后再也开不出新工蜂。`mission_scale` 返回 `workers`（运行中）与 `members`（累计）两个数。
 
@@ -118,7 +118,18 @@ Mission Control 让一个 Lead 会话把多个工蜂组织成一场「任务（M
 - `@deepseek-ai/dsh-agent-team`（`>=0.2.2-rc.3 <0.3.0`，提供 `agentTeams` 与 `subagents` 服务，必需）
 - `@deepseek-ai/cordis`（DSH 宿主底座）
 
-> **版本说明**：0.2.2-rc.3 起 Agent Teams 把队友统一为**标准 subagent 树**（不再有独立 roster），核心包也更名为 `@deepseek-ai/dsh-agent-team`。本插件 2.x 依赖这一新 API（`subagents.startActivation` / `subagents.sendMessage` / `subagents.interrupt` / `agentTeams.setEnabled` + 任务板），**不再兼容** 0.2.2-rc.1 及更早的 `@deepseek-ai/dsh-experimental-agent-team`。使用旧版请安装本仓库的 `v1.7.1`。
+> **版本说明**：0.2.2-rc.3 起 Agent Teams 把队友统一为**标准 subagent 树**（不再有独立 roster），核心包也更名为 `@deepseek-ai/dsh-agent-team`。本插件 2.x 依赖这一新 API（`subagents.startActivation` / `subagents.sendMessage` / `subagents.interrupt` / `agentTeams.setEnabled` + 任务板），**不再兼容** 0.2.2-rc.1 及更早的 `@deepseek-ai/dsh-experimental-agent-team`。仍在旧版环境时，请把仓库切到 `v1.7.1` 标签（见下方「版本选择」）。
+
+### 版本选择
+
+仓库每次发布都会打 tag，可直接按 tag 检出，避免装到不兼容的主干：
+
+| 你的 Agent Teams 版本 | 应该用的插件版本 | 检出方式 |
+| --- | --- | --- |
+| `@deepseek-ai/dsh-agent-team` `>=0.2.2-rc.3 <0.3.0` | **2.x（当前主干）** | `git clone https://github.com/Psychologist-jpg/dsh_mission-control.git` |
+| `@deepseek-ai/dsh-experimental-agent-team` `0.2.2-rc.1` | `v1.7.1` | `git clone --branch v1.7.1 --depth 1 https://github.com/Psychologist-jpg/dsh_mission-control.git` |
+
+> 已克隆的仓库可随时切版本：`git fetch --tags && git checkout v1.7.1`（回到 2.x 用 `git checkout main`）。
 
 由于采用 `link:` 安装时包管理器不会自动补装 peer 依赖，请显式把提供 `agentTeams` + `subagents` 的 Agent Teams 聚合 bundle（客户端 UI + 任务板工具 + 核心服务）加入 profile 的 `dependencies` 与 `bundles`。
 
@@ -153,7 +164,7 @@ Mission Control 让一个 Lead 会话把多个工蜂组织成一场「任务（M
 
 3. 让 profile 重新安装依赖（`pnpm install` 或由 DSH 桌面端触发）并重载客户端。
 
-4. 启动新会话后，会话头部出现蜂巢模式开关，页面右下角出现「蜂巢任务」悬浮窗，`mission_start` / `mission_scale` / `mission_report` / `mission_status` / `mission_stop` 五个工具也在工具列表中。
+4. 启动新会话后，会话头部出现蜂巢模式开关，页面右下角出现「蜂巢任务」悬浮窗，`mission_start` / `mission_scale` / `mission_set_model` / `mission_image` / `mission_report` / `mission_status` / `mission_stop` 七个工具也在工具列表中。
 
 > 依赖 Agent Teams：本插件读取 `agentTeams`（任务板与 Team 模式开关）与 `subagents`（队友的创建/消息/中断），以及 `agents`、`sessions`、`tokenMeter`、`systemPrompt`、`webServer`、`workingDirectory`、`workspaceRegistry`、`sessionController` 等服务。若 profile 已由其他 bundle 提供同名服务，可省略上面的聚合包，但必须保证 `agentTeams` 与 `subagents` 都可用。
 
@@ -177,8 +188,8 @@ Mission Control 让一个 Lead 会话把多个工蜂组织成一场「任务（M
 | `hiveOffNoticeTtlMs` | `604800000`（7 天） | 「蜂巢已关闭」纠偏标记的保留时长（0=永久）；标记随任务状态落盘，重启后仍会注入纠正段。 |
 | `snapshotCacheTtlMs` | `1000` | 面板快照缓存 TTL（0=关闭缓存）。并发轮询共享同一次计算（single-flight），任务状态变更会立即失效。 |
 | `measureCacheTtlMs` | `1000` | 上下文测量缓存 TTL。`tokenMeter.measure()` 是 O(surface)，短时复用避免多面板反复测量。 |
-| `requireHiveModeForSpawns` | `true` | 未开启蜂巢模式时禁止 `spawn_teammate`。设为 `false` 可放开。 |
-| `blockDelegationOutsideHive` | `true` | 未开启蜂巢模式时是否也禁止 `subagent` / `subagent_fork` / `workflow`；设为 `false` 恢复平台原生并行能力。 |
+| `requireHiveModeForSpawns` | —（**已废弃**） | 2.0.0 起 rc.3 移除 `spawn_teammate`，该开关不再被读取；功能由 `blockDelegationOutsideHive` 取代。保留仅为兼容旧配置文件，**不要再新增**。 |
+| `blockDelegationOutsideHive` | `true` | 未开启蜂巢模式时是否禁止 `subagent` / `subagent_fork` / `workflow`；设为 `false` 恢复平台原生并行能力。 |
 | `deleteSessionLogs` | `false` | 结束任务 / 删除子会话时是否物理删除其日志文件（默认仅归档，不删记录）。 |
 | `cleanupGlobs` | `*.tmp`、`*.temp`、`*.log`、`*.bak`、`*.orig`、`*.rej`、`*.swp`、`*.swo`、`*~`、`.DS_Store`、`Thumbs.db` | 「结束任务」时删除的临时文件模式（仅按文件名匹配）。 |
 | `cleanupDirs` | `[".mission-control/tmp"]` | 「结束任务」时整个删除的临时目录（相对工作目录）。 |
@@ -204,7 +215,6 @@ Mission Control 让一个 Lead 会话把多个工蜂组织成一场「任务（M
         defaultCap: 3
         freshProvider: spawn
         maxHandoffRounds: 3
-        requireHiveModeForSpawns: true
         blockDelegationOutsideHive: true
         deleteSessionLogs: false
         imageModelSwitch: false
@@ -257,7 +267,7 @@ mission-control/
 
 1. Lead 开启会话头部的蜂巢模式开关（或调用 `mission_start`），给出任务目标与并发工蜂上限；蜂巢模式下首条人类消息也会自动记录为任务目标。
 2. Lead 把任务拆解成独立子任务建到共享任务板，按「目标 = min(子任务数, 上限)」算好人数。
-3. 用 `mission_scale` 一次性开出所需子会话（只补差额，超上限拒绝）；之后仍可逐个 `spawn_teammate`（**前提是蜂巢模式已开启**）。
+3. 用 `mission_scale` 一次性开出所需子会话（只补差额，超上限拒绝）。**蜂巢模式下只能这样创建队友**：直接调 `subagent` / `subagent_fork` 会被守卫拒绝（见 `forceMissionScaleDelegation`），因为它们会绕过人数上限、不进面板、结束时不被归档。
 4. 工蜂在共享任务板上认领任务，并随时用 `mission_report` 汇报进度；需要生成图片时调用 `mission_image` 出图（不要切换自己的对话模型）。
 5. Lead 与人类可随时查看悬浮窗或调用 `mission_status`；需要让子会话安静但继续工作时，可切换为「已暂停」。
 6. 工蜂上下文将满时，哨兵自动中断并创建 `<name>-rN` 续任者，继承结构化摘要继续工作（同一交接链最多 `maxHandoffRounds` 代）。
@@ -267,7 +277,7 @@ mission-control/
 
 ## 注意事项
 
-- **蜂巢开关是子会话唯一入口**：默认未开启蜂巢模式时，`spawn_teammate`、`subagent`、`subagent_fork`、`workflow` 都会被拒绝。想让平台恢复原生并行能力，把 `requireHiveModeForSpawns` 与 `blockDelegationOutsideHive` 设为 `false`。
+- **蜂巢开关是子会话唯一入口**：默认未开启蜂巢模式时，`subagent`、`subagent_fork`、`workflow` 都会被拒绝；开启后 `subagent` / `subagent_fork` 仍会被要求改用 `mission_scale`。想让平台恢复原生并行能力，把 `blockDelegationOutsideHive` 设为 `false`；想允许蜂巢模式下直连 `subagent`，把 `forceMissionScaleDelegation` 设为 `false`。
 - **任务状态会落盘**：状态文件在 `$DSH_HOME/storages/mission-control/missions.json`，重启后自动恢复并会对账；超过 7 天的旧任务直接丢弃。删除该文件可强制清空。
 - **清理有边界**：「结束任务」只会删除 `cleanupGlobs` 匹配的文件与 `cleanupDirs` 指定的目录，且永远跳过 `node_modules` 与 `.git`；但如果你把 `cleanupGlobs` 配得过宽，仍可能误删工作文件，请谨慎配置。
 - **归档 vs 彻底删除**：归档可逆（日志保留，可「取消归档」恢复）；「彻底删除」会一并删除会话日志目录与投影缓存，**不可恢复**，请谨慎操作。

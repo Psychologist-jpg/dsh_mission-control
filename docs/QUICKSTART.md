@@ -24,7 +24,7 @@
 
 | 状态 | 含义 |
 | --- | --- |
-| `普通` | 未开启，不会创建任务；**此时禁止开任何子会话**（`spawn_teammate` / `subagent` / `workflow` 都会被拒绝） |
+| `普通` | 未开启，不会创建任务；**此时禁止开任何子会话**（`subagent` / `subagent_fork` / `workflow` 都会被拒绝） |
 | `蜂巢` | 已开启，主会话消息会下发给所有子会话 |
 | `已暂停` | 子会话仍在跑，但主会话消息**不再**下发（想安静推进时用），同样不再允许新开子会话 |
 
@@ -32,7 +32,7 @@
 
 > 也可以用命令开启：让 Lead 调用 `mission_start`（见下一步），效果等价。
 >
-> 如果你希望「普通」模式下仍能用平台原生的 `subagent` / `workflow`，把 `blockDelegationOutsideHive` 与 `requireHiveModeForSpawns` 设为 `false`。
+> 如果你希望「普通」模式下仍能用平台原生的 `subagent` / `workflow`，把 `blockDelegationOutsideHive` 设为 `false`；若还想在蜂巢模式下直连 `subagent`（跳过 `mission_scale` 的配平与上限），再把 `forceMissionScaleDelegation` 设为 `false`。
 
 ---
 
@@ -177,7 +177,7 @@ Cap: 3
 说明当前**活跃**子会话已达上限（已交接 / 已归档 / 已删除的不占名额）。先在悬浮窗「子会话」弹窗里归档不再需要的，或把头部的人数调大。
 
 **Q：报「蜂巢模式未开启，禁止创建子会话」？**
-这是委派守卫：蜂巢开关是子会话唯一入口。先打开蜂巢开关；不想被拦就把 `requireHiveModeForSpawns` / `blockDelegationOutsideHive` 设为 `false`。
+这是委派守卫：蜂巢开关是子会话唯一入口。先打开蜂巢开关；不想被拦就把 `blockDelegationOutsideHive` 设为 `false`。若报的是「请用 `mission_scale` 创建子会话」，说明蜂巢已开启但绕过了配平，把 `forceMissionScaleDelegation` 设为 `false` 可放行（不推荐）。
 
 **Q：`mission_scale` 一直 `refused`？**
 多半是缺少 `name` 或 `task`（两者都必填），或者超出上限。看返回里 `refused` 的具体名单。
