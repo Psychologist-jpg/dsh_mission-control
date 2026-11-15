@@ -58,6 +58,12 @@ const DEFAULT_CONFIG = {
   // 性能：面板快照缓存 TTL（0=关闭缓存）、上下文测量缓存 TTL
   snapshotCacheTtlMs: 1000,
   measureCacheTtlMs: 1000,
+  // 新成员宽限期：刚 spawn 的子会话可能还列不进 listDescendants，期间不剪掉
+  memberGraceMs: 60000,
+  // 蜂巢模式下强制用 mission_scale 创建子会话（否则绕过人数上限）
+  forceMissionScaleDelegation: true,
+  // "蜂巢已关闭"纠偏标记的保留时长（0=永久）
+  hiveOffNoticeTtlMs: 7 * 24 * 60 * 60 * 1000,
   imageKeywords: [
     '生图', '生成图片', '画图', '绘制', '插图', '配图', '出图',
     '海报', '封面图', '示意图', '图片生成', '文生图',
@@ -132,7 +138,7 @@ export function apply(ctx, rawConfig) {
    * 曾经开过蜂巢模式、但现在已经关闭/结束的会话。
    * 系统提示据此补一条"回到普通会话"的指令，压掉对话历史里残留的旧分派契约。
    */
-  const hiveOffNotice = new Set()
+  const hiveOffNotice = new Map()
 
   // ── C1 持久化：任务状态落盘，重启/重载后恢复 ──────────────────────────────
   const stateDir = () => join(dshHome(), 'storages', 'mission-control')
@@ -170,6 +176,7 @@ export function apply(ctx, rawConfig) {
       workerBaseModels: entries(mission.workerBaseModels),
       memberIds,
       members: entries(mission.members),
+      ownedIds: arr(mission.ownedIds),
       memberReports,
       lastHandoff: mission.lastHandoff ?? null,
       lastError: mission.lastError ?? null,
@@ -196,6 +203,7 @@ export function apply(ctx, rawConfig) {
       handedOff: asSet(raw.handedOff),
       retired: asSet(raw.retired),
       members: asMap(raw.members),
+      ownedIds: asSet(raw.ownedIds),
       workerModels: asMap(raw.workerModels),
       workerBaseModels: asMap(raw.workerBaseModels),
       lastHandoff: raw.lastHandoff ?? undefined,
@@ -220,6 +228,9 @@ export function apply(ctx, rawConfig) {
           version: 1,
           savedAt: Date.now(),
           missions: [...missions.values()].map(serializeMission),
+          // 已关闭蜂巢的会话：重启后仍要向这些会话注入"已回到普通会话"的纠正段，
+          // 否则历史里的旧分派契约可能再次生效。带时间戳以便按 TTL 淘汰。
+          hiveOff: [...hiveOffNotice.entries()].map(([id, at]) => [id, Number(at) || Date.now()]),
         }
         const tmp = `${file}.tmp`
         writeFileSync(tmp, JSON.stringify(payload), 'utf8')
@@ -330,9 +341,23 @@ export function apply(ctx, rawConfig) {
       if (loaded > 0) {
         // 让恢复出来的会话回到正确提示状态
         for (const mission of missions.values()) {
-          if (mission.paused === true) hiveOffNotice.add(mission.sessionId)
+          if (mission.paused === true) hiveOffNotice.set(mission.sessionId, Date.now())
           else hiveOffNotice.delete(mission.sessionId)
         }
+      }
+      // 恢复"蜂巢已关闭"标记：重启后仍需向这些会话注入纠正段，
+      // 否则历史里的旧分派契约可能再次生效。超过 TTL 的自动淘汰。
+      const noticeTtl = Math.max(0, Number(config.hiveOffNoticeTtlMs) || 0)
+      for (const pair of Array.isArray(raw?.hiveOff) ? raw.hiveOff : []) {
+        if (!Array.isArray(pair)) continue
+        const id = String(pair[0] ?? '')
+        const at = Number(pair[1]) || 0
+        if (!id) continue
+        if (noticeTtl > 0 && at > 0 && Date.now() - at > noticeTtl) continue
+        // 已有任务且未暂停的会话不保留该标记（它是"当前在跑任务"的）
+        const mission = missions.get(id)
+        if (mission && mission.paused !== true) continue
+        hiveOffNotice.set(id, at || Date.now())
       }
     } catch {
       // 损坏的状态文件不应阻止插件启动
@@ -372,28 +397,58 @@ export function apply(ctx, rawConfig) {
   async function refreshMembers(mission) {
     const subs = services.subagents()
     if (!subs || !mission) return mission?.members ?? new Map()
-    mission.members = mission.members ?? new Map()
+    // 串行化：哨兵定时刷新与 spawn 后的即时刷新可能并发，
+    // 并发的 listDescendants 快照互相覆盖会误剪刚创建的成员。
+    if (mission.refreshing) return mission.refreshing
+    mission.refreshing = (async () => {
+      mission.members = mission.members ?? new Map()
     let rows
     try {
       rows = await subs.listDescendants(mission.sessionId)
     } catch {
       return mission.members
     }
-    const seen = new Set()
-    const baseline = mission.baseline ?? new Set()
+    const byId = new Map()
     for (const row of rows ?? []) {
-      if (!row || row.kind !== 'child' || !row.id) continue
-      const id = String(row.id)
-      const name = String(row.path || row.name || row.label || id)
-      if (baseline.has(name)) continue
-      mission.members.set(id, { name, label: row.label ?? '' })
-      seen.add(id)
+      if (row && row.kind === 'child' && row.id) byId.set(String(row.id), row)
     }
-    // 只保留仍在树里的成员
+    const now = Date.now()
+    const grace = Math.max(0, Number(config.memberGraceMs) || 0)
+    const owned = mission.ownedIds ?? new Set()
+    // 只承认本任务通过 spawnChild() 创建并登记过的成员；
+    // 树里其它既存子代理（任务开始前、或模型改用 subagent 产生的）一律不吸收。
     for (const id of [...mission.members.keys()]) {
-      if (!seen.has(id)) mission.members.delete(id)
+      const row = byId.get(id)
+      if (!row) {
+        // 新成员在创建窗口内可能还列不出来：给一段宽限期，避免刚 spawn 就被剪掉
+        const info = mission.members.get(id)
+        if (grace > 0 && info?.addedAt && now - info.addedAt < grace) continue
+        mission.members.delete(id)
+        continue
+      }
+      const info = mission.members.get(id) ?? {}
+      mission.members.set(id, {
+        ...info,
+        name: String(row.path || row.label || info.name || id),
+        label: row.label ?? info.label ?? '',
+      })
     }
-    return mission.members
+    // 登记过但尚未进缓存的新成员补进来
+    for (const id of owned) {
+      if (mission.members.has(id) || !byId.has(id)) continue
+      const row = byId.get(id)
+      mission.members.set(id, {
+        name: String(row.path || row.label || id),
+        label: row.label ?? '',
+        addedAt: now,
+      })
+    }
+      return mission.members
+      })()
+        .finally(() => {
+          mission.refreshing = undefined
+        })
+    return mission.refreshing
   }
 
   function teammatesOf(agent) {
@@ -431,10 +486,15 @@ export function apply(ctx, rawConfig) {
       delivery: 'parent',
     })
     mission.members = mission.members ?? new Map()
-    mission.members.set(String(activation.childId), {
+    mission.ownedIds = mission.ownedIds ?? new Set()
+    const childId = String(activation.childId)
+    mission.members.set(childId, {
       name: String(activation.name || name),
       label: name,
+      addedAt: Date.now(),
     })
+    // 登记为本任务创建：refreshMembers 只承认这些 id，避免吸收既存子代理
+    mission.ownedIds.add(childId)
     persistState()
     return activation
   }
@@ -631,12 +691,22 @@ export function apply(ctx, rawConfig) {
     })
   }
 
-  /** 当前任务实际创建的成员（排除开任务前就已存在的旧工蜂）。 */
+  /**
+   * 当前任务实际创建的成员。
+   * mission.members 现在只登记 spawnChild() 创建并写入 ownedIds 的子会话，
+   * 因此不再需要按 baseline 名字过滤（那会误伤重名的新成员）。
+   */
   function missionMembers(mission) {
     const agent = services.agents()?.get(mission.sessionId)
     if (!agent) return []
-    const baseline = mission.baseline ?? new Set()
-    return teammatesOf(agent).filter((m) => !baseline.has(m.name))
+    const owned = mission.ownedIds
+    const rows = teammatesOf(agent)
+    // 旧存档可能没有 ownedIds：此时退回按 baseline 名字过滤，保持兼容
+    if (!owned || owned.size === 0) {
+      const baseline = mission.baseline ?? new Set()
+      return rows.filter((m) => !baseline.has(m.name))
+    }
+    return rows.filter((m) => owned.has(String(m.id)))
   }
 
   /**
@@ -682,12 +752,25 @@ export function apply(ctx, rawConfig) {
     const tasks = missionTasks(mission)
     const open = tasks.filter((t) => t.status === 'pending' || t.status === 'in_progress')
     const unowned = open.filter((t) => !t.ownerName)
-    // 活跃工蜂：统一口径（排除已交接 / 已退休），避免出现 4/2 这种越界计数
-    const workers = activeMembersOf(mission).length
+    // 并发上限只看「正在运行」的成员：continuable 子代理完成后不会消失，
+    // 若按累计成员计数，上限会退化为总值，之后再也开不出新工蜂。
+    const active = activeMembersOf(mission)
+    const running = active.filter(
+      (m) => m.status === 'running' || m.status === 'provisioning',
+    )
+    const workers = running.length
     const cap = Number(mission.cap) || 1
     const target = Math.min(Math.max(unowned.length, open.length ? 1 : 0), cap)
     const gap = Math.max(0, target - workers)
-    return { workers, cap, openTasks: open.length, unownedTasks: unowned.length, target, gap }
+    return {
+      workers,
+      cap,
+      members: active.length,
+      openTasks: open.length,
+      unownedTasks: unowned.length,
+      target,
+      gap,
+    }
   }
 
   /** 测量一个成员会话的上下文压力（带短时缓存，measure 为 O(surface)）。 */
@@ -1040,10 +1123,13 @@ export function apply(ctx, rawConfig) {
         mission.handedOff?.add(name)
         return
       }
-      // 交接是「替换」：退休的旧成员会被标记 handedOff、归档并移出活跃名单。
-      // 因此按统一口径的「活跃工蜂数」判定，满员任务同样可以交接。
-      if (activeMembersOf(mission).length > mission.cap) {
-        mission.lastError = `交接被跳过：活跃工蜂已超过上限 ${mission.cap}`
+      // 交接是「替换」：旧成员被标记 handedOff、归档并移出活跃名单，
+      // 续任者顶替同一个名额。因此这里的守卫只拦"并发已经超限"的异常状态。
+      const runningNow = activeMembersOf(mission).filter(
+        (m) => m.status === 'running' || m.status === 'provisioning',
+      )
+      if (runningNow.length > mission.cap) {
+        mission.lastError = `交接被跳过：并发工蜂已超过上限 ${mission.cap}`
         mission.handedOff?.add(name)
         return
       }
@@ -1171,6 +1257,7 @@ export function apply(ctx, rawConfig) {
           handoffRounds: new Map(),
           handedOff: new Set(),
           members: new Map(),
+          ownedIds: new Set(),
         })
       }
       persistState()
@@ -1248,9 +1335,10 @@ export function apply(ctx, rawConfig) {
           modelSwitches: { type: 'array', items: { type: 'string' } },
           modelErrors: { type: 'array', items: { type: 'string' } },
           workers: { type: 'integer' },
+          members: { type: 'integer' },
           cap: { type: 'integer' },
         },
-        required: ['spawned', 'skipped', 'refused', 'modelSwitches', 'modelErrors', 'workers', 'cap'],
+        required: ['spawned', 'skipped', 'refused', 'modelSwitches', 'modelErrors', 'workers', 'members', 'cap'],
       },
       render: (_args, value) => [
         textBlock(
@@ -1301,8 +1389,11 @@ export function apply(ctx, rawConfig) {
           skipped.push(rawName)
           continue
         }
-        // 名额按活跃工蜂计：已交接 / 已退休的成员不再占用名额
-        if (activeMembersOf(mission).length >= mission.cap) {
+        // 并发名额只看正在运行的成员（已交接/已退休/已完成的不占名额）
+        const runningNow = activeMembersOf(mission).filter(
+          (m) => m.status === 'running' || m.status === 'provisioning',
+        )
+        if (runningNow.length >= mission.cap) {
           refused.push(rawName)
           continue
         }
@@ -1339,7 +1430,10 @@ export function apply(ctx, rawConfig) {
         refused,
         modelSwitches,
         modelErrors,
-        workers: activeMembersOf(mission).length,
+        workers: activeMembersOf(mission).filter(
+          (m) => m.status === 'running' || m.status === 'provisioning',
+        ).length,
+        members: activeMembersOf(mission).length,
         cap: mission.cap,
       }
     },
@@ -1643,7 +1737,7 @@ export function apply(ctx, rawConfig) {
       const sessionId = String(agent.id)
       const mission = missions.get(sessionId)
       if (!mission) {
-        hiveOffNotice.add(sessionId)
+        hiveOffNotice.set(sessionId, Date.now())
         return { ok: true, interrupted: [], archived: [], removedTempFiles: 0, retiredWorkers: 0 }
       }
 
@@ -1652,8 +1746,8 @@ export function apply(ctx, rawConfig) {
       const interrupted = []
       for (const member of active) {
         if (member.status !== 'running' && member.status !== 'provisioning') continue
-        interruptMember(agent, member.id)
-        interrupted.push(member.name)
+        // 只有真的中断成功才计入"已停止"，否则报告会虚高
+        if (interruptMember(agent, member.id)) interrupted.push(member.name)
       }
 
       // 归档活跃成员的会话，避免留下"仍在跑但无人监控"的孤儿
@@ -1670,7 +1764,7 @@ export function apply(ctx, rawConfig) {
       }
 
       missions.delete(sessionId)
-      hiveOffNotice.add(sessionId)
+      hiveOffNotice.set(sessionId, Date.now())
       persistState()
       pruneCaches(liveMemberIds())
 
@@ -1693,25 +1787,33 @@ export function apply(ctx, rawConfig) {
     const mission = missions.get(sessionId)
     const hiveOn = Boolean(mission && mission.paused !== true)
 
-    // 1) 团队工蜂：只有在蜂巢模式开启时才允许创建
-    if (exec.name === 'spawn_teammate') {
-      if (config.requireHiveModeForSpawns !== false && !hiveOn) {
-        return 'mission-control: 蜂巢模式未开启，禁止创建子会话。请先在会话标题栏打开蜂巢开关。'
+    // 团队工蜂与平台委派统一裁决：rc.3 已移除 spawn_teammate，队友一律通过
+    // subagent / subagent_fork / workflow 创建；若在蜂巢模式下放行，会完全绕过人数上限，
+    // 且产生的子会话不进面板、结束时不被归档。因此蜂巢开启时要求统一走 mission_scale。
+    const DELEGATION_TOOLS = new Set(['subagent', 'subagent_fork', 'workflow', 'spawn_teammate'])
+    if (DELEGATION_TOOLS.has(exec.name)) {
+      if (!hiveOn) {
+        if (config.blockDelegationOutsideHive === true) {
+          return 'mission-control: 蜂巢模式未开启，禁止开子会话。如需并行工作，请先打开蜂巢开关。'
+        }
+        return undefined
       }
-      if (!mission) return undefined
-      // 与 mission_scale / 面板同一口径：活跃工蜂（排除已交接/已退休）占名额
+      // 蜂巢开启：统一走 mission_scale，才能计入上限、进入面板、被收尾归档
+      if (config.forceMissionScaleDelegation !== false && exec.name !== 'workflow') {
+        return (
+          'mission-control: 蜂巢模式下请用 `mission_scale` 创建子会话（它按人数上限配平并纳入监控）；' +
+          '直接用 `subagent` 会绕过上限且不在面板显示。'
+        )
+      }
       const active = activeMembersOf(mission)
-      if (active.length >= mission.cap) {
-        return `mission-control: 本次任务的上限是 ${mission.cap} 个并发工蜂，已满，拒绝再创建`
+      const running = active.filter(
+        (m) => m.status === 'running' || m.status === 'provisioning',
+      )
+      // 并发上限只数正在运行的成员：完成但未归档的队友不应永久占名额
+      if (running.length >= mission.cap) {
+        return `mission-control: 本次任务的并发上限是 ${mission.cap}，当前 ${running.length} 个在运行，拒绝再创建`
       }
       return undefined
-    }
-
-    // 2) 平台内置委派（subagent / subagent_fork / workflow）：同样只在蜂巢模式开启时允许
-    if (config.blockDelegationOutsideHive === true
-      && (exec.name === 'subagent' || exec.name === 'subagent_fork' || exec.name === 'workflow')
-      && !hiveOn) {
-      return 'mission-control: 蜂巢模式未开启，禁止开子会话。如需并行工作，请先打开蜂巢开关。'
     }
 
     return undefined
@@ -1793,7 +1895,7 @@ export function apply(ctx, rawConfig) {
 
             // 模式被关闭（暂停）：明确告知按普通会话处理，不注入任何分派契约
             if (mission.paused === true) {
-              hiveOffNotice.add(sessionId)
+              hiveOffNotice.set(sessionId, Date.now())
               return [
                 '## 蜂巢模式已关闭（当前为普通会话）',
                 '本次蜂巢任务处于暂停/关闭状态：子会话继续工作，但你**不要再分派新任务**，',
@@ -1809,7 +1911,7 @@ export function apply(ctx, rawConfig) {
               return [
                 '## 蜂巢任务：必须补开子会话',
                 `你已收到任务，但当前只有 ${stats.workers} 个子会话，按拆解结果需要 ${stats.target} 个（上限 ${stats.cap}）。`,
-                `**现在必须再开 ${stats.gap} 个子会话**（调用 \`mission_scale\`，或逐个 \`spawn_teammate\`），`,
+                `**现在必须再开 ${stats.gap} 个子会话**（调用 \`mission_scale\`，一次补齐差额），`,
                 '然后才继续协调。不要自己把剩余工作做完。',
               ].join('\n')
             }
@@ -1832,9 +1934,9 @@ export function apply(ctx, rawConfig) {
               '- 已有子会话但少于目标 → **只补开差额**，不要重复开；',
               '- 子会话汇报完成 → 用 `mission_report` 之外的方式验收文件/结果。',
               '',
-              '注意：团队花名册可能残留**已归档/已删除的历史条目**（平台无法移除成员），',
-              '它们不算本次任务的工蜂。只以 `mission_scale` 返回的、以及面板中显示的活跃工蜂为准；',
-              '不要给历史失效成员发消息。名字冲突时 `mission_scale` 会自动加后缀，以返回的名单为准。',
+              '注意：会话里可能存在**本任务之前就有的子会话**（历史分析、旧任务残留），它们不算本次任务的工蜂。',
+              '只以 `mission_scale` 返回的、以及面板中显示的活跃工蜂为准；不要给它们发消息。',
+              '蜂巢模式下请一律用 `mission_scale` 创建子会话，不要直接调用 `subagent`（会被拒绝）。',
             ].join('\n')
           },
         })
@@ -1943,16 +2045,17 @@ export function apply(ctx, rawConfig) {
           handoffRounds: new Map(),
           handedOff: new Set(),
           members: new Map(),
+          ownedIds: new Set(),
         })
       }
     } else if (existing) {
       existing.paused = true
       if (workers !== undefined) existing.cap = workers
       // 关闭模式：标记该会话，让系统提示补一条"回到普通会话"的纠正指令
-      hiveOffNotice.add(sessionId)
+      hiveOffNotice.set(sessionId, Date.now())
     } else {
       // 没有任务但用户特意关掉开关：同样保证后续按普通会话处理
-      hiveOffNotice.add(sessionId)
+      hiveOffNotice.set(sessionId, Date.now())
     }
 
     const mission = missions.get(sessionId)
@@ -2589,14 +2692,14 @@ export function apply(ctx, rawConfig) {
           if (!activeNames.has(member.name)) continue
           closing.push(member)
           if (member.status !== 'running' && member.status !== 'provisioning') continue
-          interruptMember(agent, member.id)
-          interrupted.push(member.name)
+          // 只有真的中断成功才计入"已停止"，否则报告会虚高
+          if (interruptMember(agent, member.id)) interrupted.push(member.name)
         }
         retireMembers(mission.sessionId, [...activeNames])
       }
       missions.delete(mission.sessionId)
       // 任务已结束：让后续轮次明确回到普通会话，压掉历史里的旧分派契约
-      hiveOffNotice.add(String(mission.sessionId))
+      hiveOffNotice.set(String(mission.sessionId), Date.now())
       // 关闭平台 Team 模式
       void setTeamMode(agent, false)
       // 清掉该任务成员的汇报与缓存，避免长期累积

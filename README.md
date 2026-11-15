@@ -28,12 +28,14 @@ Mission Control 让一个 Lead 会话把多个工蜂组织成一场「任务（M
 
 1. **委派守卫与人数上限（Delegation Guard & Workers Cap）**
    所有「开子会话」的入口都由 `ctx.tools.guard` 统一把关：
-   - **未开启蜂巢模式时**，`spawn_teammate` 被拒绝；`blockDelegationOutsideHive` 开启时（默认），平台内置的 `subagent` / `subagent_fork` / `workflow` 也一并拒绝 —— 蜂巢开关是子会话的唯一入口；
-   - **开启后**按 `workers` 检查上限，计数口径为**活跃工蜂**（见下一条），超限即拒绝；
-   - `mission_scale` 内部同样走这套口径，不会出现 `spawn` 与 `scale` 两套标准。
+   - **未开启蜂巢模式时**，`subagent` / `subagent_fork` / `workflow`（以及旧版的 `spawn_teammate`）一律被拒绝（`blockDelegationOutsideHive`，默认开）—— 蜂巢开关是子会话的唯一入口；
+   - **蜂巢模式下**，`subagent` / `subagent_fork` 会被要求改用 `mission_scale`（`forceMissionScaleDelegation`，默认开），否则会绕过上限、不进面板、结束时不被归档；
+   - **并发上限只数「正在运行」的成员**（`running` / `provisioning`）：`continuable` 子代理完成后不会消失，若按累计成员计数，上限会退化成总值、之后再也开不出新工蜂。`mission_scale` 返回 `workers`（运行中）与 `members`（累计）两个数。
 
 2. **统一的活跃工蜂口径（Active Members）**
-   队友的**唯一来源是平台的 subagent 树**：`refreshMembers()` 调 `subagents.listDescendants()` 把成员刷新进任务级缓存 `mission.members`（成员 id → 名称/label），其余同步逻辑（守卫、面板、广播、收尾）都读这份缓存；任务状态落盘时会一并保存，重启后可恢复。
+   队友的**唯一来源是平台的 subagent 树**：`refreshMembers()` 调 `subagents.listDescendants()` 刷新任务级缓存 `mission.members`（成员 id → 名称/label），其余同步逻辑（守卫、面板、广播、收尾）都读这份缓存；任务状态落盘时一并保存，重启后可恢复。
+   - **只认本任务创建的成员**：`spawnChild()` 会把子会话 id 记入 `ownedIds`，刷新时只吸收这批 id，会话里既存的其它子代理（历史分析、旧任务残留）不会被误当成工蜂；旧存档没有 `ownedIds` 时退回按 `baseline` 名字过滤。
+   - **刷新串行化 + 宽限期**：并发刷新会互相覆盖快照、误剪刚创建的成员，因此同一任务同一时刻只跑一次刷新；新建成员在 `memberGraceMs` 内即使暂时列不出来也保留。
    `activeMembersOf()` = 任务成员 − 已交接（`handedOff`）− 已退休（`retired`：归档/删除/交接过的成员）。**计数、上限判定、面板显示、广播、哨兵、结束收尾全部只认这一份名单**，避免出现「4/2 越界计数」「给已归档成员反复广播」「哨兵对已交接成员反复开续任者」等问题。归档/删除/交接动作都会立即把成员标记退休。
 
 3. **平台 Team 模式联动（Team Mode）**
@@ -170,6 +172,9 @@ Mission Control 让一个 Lead 会话把多个工蜂组织成一场「任务（M
 | `fallbackContextWindow` | `131072` | 拿不到真实上下文窗口大小时使用的分母。 |
 | `freshProvider` | `"spawn"` | 交接时创建续任者使用的 provider 参数。 |
 | `maxHandoffRounds` | `3` | 同一条交接链（按链根名统计）最多续任几代，防止阈值异常时无限 spawn。 |
+| `memberGraceMs` | `60000` | 新成员宽限期：刚创建的子会话可能暂时列不进 `listDescendants`，期间不把它从成员缓存里剪掉。 |
+| `forceMissionScaleDelegation` | `true` | 蜂巢模式下强制用 `mission_scale` 创建子会话；直接 `subagent` / `subagent_fork` 会被拒绝（否则绕过人数上限、不进面板、结束时不被归档）。`workflow` 不受此限制。 |
+| `hiveOffNoticeTtlMs` | `604800000`（7 天） | 「蜂巢已关闭」纠偏标记的保留时长（0=永久）；标记随任务状态落盘，重启后仍会注入纠正段。 |
 | `snapshotCacheTtlMs` | `1000` | 面板快照缓存 TTL（0=关闭缓存）。并发轮询共享同一次计算（single-flight），任务状态变更会立即失效。 |
 | `measureCacheTtlMs` | `1000` | 上下文测量缓存 TTL。`tokenMeter.measure()` 是 O(surface)，短时复用避免多面板反复测量。 |
 | `requireHiveModeForSpawns` | `true` | 未开启蜂巢模式时禁止 `spawn_teammate`。设为 `false` 可放开。 |
