@@ -28,11 +28,11 @@
 | `蜂巢` | 已开启，主会话消息会下发给所有子会话 |
 | `已暂停` | 子会话仍在跑，但主会话消息**不再**下发（想安静推进时用），同样不再允许新开子会话 |
 
-旁边的数字选择器（2–10）设定**并发子会话上限**；它只改上限，不会误触发开关。
+旁边的数字选择器（2–10）设定**并发子会话上限**（口径是「同时存在多少个工蜂」，跑完但未归档的空闲成员仍占名额）；它只改上限，不会误触发开关。
 
 > 也可以用命令开启：让 Lead 调用 `mission_start`（见下一步），效果等价。
 >
-> 如果你希望「普通」模式下仍能用平台原生的 `subagent` / `workflow`，把 `blockDelegationOutsideHive` 设为 `false`；若还想在蜂巢模式下直连 `subagent`（跳过 `mission_scale` 的配平与上限），再把 `forceMissionScaleDelegation` 设为 `false`。
+> 如果你希望「普通」模式下仍能用平台原生的 `subagent` / `workflow`，把 `blockDelegationOutsideHive` 设为 `false`；若还想在蜂巢模式下绕过 `mission_scale` 直连 `subagent` / `workflow`（放弃配平、上限与归档），再把 `forceMissionScaleDelegation` 设为 `false`。
 
 ---
 

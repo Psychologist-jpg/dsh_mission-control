@@ -13,6 +13,10 @@
 import { readdir, unlink, rm, mkdir, writeFile } from 'node:fs/promises'
 import { existsSync, statSync, readdirSync, readFileSync, mkdirSync, writeFileSync, renameSync } from 'node:fs'
 import { join, resolve, sep, dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+/** 插件自身目录：结果文件兜底扫描时排除，避免把插件源码当成工蜂产出。 */
+const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url))
 
 const DEFAULT_CONFIG = {
   pollIntervalMs: 15000,
@@ -750,20 +754,26 @@ export function apply(ctx, rawConfig) {
     const tasks = missionTasks(mission)
     const open = tasks.filter((t) => t.status === 'pending' || t.status === 'in_progress')
     const unowned = open.filter((t) => !t.ownerName)
-    // 并发上限只看「正在运行」的成员：continuable 子代理完成后不会消失，
-    // 若按累计成员计数，上限会退化为总值，之后再也开不出新工蜂。
     const active = activeMembersOf(mission)
     const running = active.filter(
       (m) => m.status === 'running' || m.status === 'provisioning',
     )
+    const idle = active.filter(
+      (m) => m.status !== 'running' && m.status !== 'provisioning',
+    )
     const workers = running.length
     const cap = Number(mission.cap) || 1
     const target = Math.min(Math.max(unowned.length, open.length ? 1 : 0), cap)
-    const gap = Math.max(0, target - workers)
+    // 上限是「并发」口径，但名额是「累计」的：continuable 子代理不会消失，
+    // 所以补人时必须先扣掉仍占着名额的空闲成员，否则累计成员会突破 cap。
+    const slots = Math.max(0, cap - idle.length - workers)
+    const gap = Math.min(Math.max(0, target - workers), slots)
     return {
       workers,
+      idle: idle.length,
       cap,
       members: active.length,
+      slots,
       openTasks: open.length,
       unownedTasks: unowned.length,
       target,
@@ -1387,11 +1397,10 @@ export function apply(ctx, rawConfig) {
           skipped.push(rawName)
           continue
         }
-        // 并发名额只看正在运行的成员（已交接/已退休/已完成的不占名额）
-        const runningNow = activeMembersOf(mission).filter(
-          (m) => m.status === 'running' || m.status === 'provisioning',
-        )
-        if (runningNow.length >= mission.cap) {
+        // 名额按「累计成员」判：continuable 子代理不会消失，空闲成员仍占位，
+        // 否则反复补人会突破人数上限（并发口径只用于显示与哨兵）。
+        const activeNow = activeMembersOf(mission)
+        if (activeNow.length >= mission.cap) {
           refused.push(rawName)
           continue
         }
@@ -1796,20 +1805,25 @@ export function apply(ctx, rawConfig) {
         }
         return undefined
       }
-      // 蜂巢开启：统一走 mission_scale，才能计入上限、进入面板、被收尾归档
-      if (config.forceMissionScaleDelegation !== false && exec.name !== 'workflow') {
+      // 蜂巢开启：统一走 mission_scale，才能计入上限、进入面板、被收尾归档。
+      // workflow 也不放行：它内部会扇出任意多个 subagent，这些子会话无法登记，
+      // 既不计名额也不进面板，结束任务时更不会被归档。
+      if (config.forceMissionScaleDelegation !== false) {
         return (
           'mission-control: 蜂巢模式下请用 `mission_scale` 创建子会话（它按人数上限配平并纳入监控）；' +
-          '直接用 `subagent` 会绕过上限且不在面板显示。'
+          '直接用 `subagent` / `subagent_fork` / `workflow` 会绕过上限且不在面板显示。'
         )
       }
       const active = activeMembersOf(mission)
       const running = active.filter(
         (m) => m.status === 'running' || m.status === 'provisioning',
       )
-      // 并发上限只数正在运行的成员：完成但未归档的队友不应永久占名额
-      if (running.length >= mission.cap) {
-        return `mission-control: 本次任务的并发上限是 ${mission.cap}，当前 ${running.length} 个在运行，拒绝再创建`
+      // 名额按累计成员判（空闲成员仍占位）；并发口径只用于展示
+      if (active.length >= mission.cap) {
+        return (
+          `mission-control: 本次任务的名额是 ${mission.cap} 个工蜂，当前已有 ${active.length} 个` +
+          `（运行中 ${running.length}），拒绝再创建。可先用「子会话」管理归档空闲成员。`
+        )
       }
       return undefined
     }
@@ -2728,9 +2742,14 @@ export function apply(ctx, rawConfig) {
     let leadNotified = false
     for (const job of finishing) {
       const files = collectResultFiles(job.members, deletedSet, job.root)
-      // 兜底：本任务开始后修改过的文件也算产出（覆盖 pwsh 等非结构化写入）
-      for (const file of scanRecentFiles(job.root, job.mission.startedAt - 2000, deletedSet)) {
-        if (!files.includes(file)) files.push(file)
+      // 兜底：只有「写类工具一个文件都没收集到」时才扫 mtime。
+      // 否则 Lead 自己改过的源码（如 index.js）也会被当成工蜂产出；
+      // 同时排除插件自身目录（源码/文档不是本次任务的交付物）。
+      if (files.length === 0) {
+        for (const file of scanRecentFiles(job.root, job.mission.startedAt - 2000, deletedSet)) {
+          if (file.startsWith(PLUGIN_DIR)) continue
+          if (!files.includes(file)) files.push(file)
+        }
       }
       for (const file of files) if (!resultFiles.includes(file)) resultFiles.push(file)
       const notified = await askLeadToSummarize(job.mission, {

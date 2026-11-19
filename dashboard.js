@@ -696,9 +696,25 @@ window.__ModuleLoader__.load({
       const pct = total > 0 ? Math.round((completed / total) * 100) : 0;
       const paused = missions.some((m) => m.paused === true);
       const scale = mission.scale || null;
+      // 人数上限是「累计」口径：空闲成员仍占名额，所以除了运行中数量，
+      // 还要显示累计成员与占用名额的空闲数，避免「0/3 却列着 2 个成员」的困惑。
+      const idle = Number(scale?.idle) || 0;
+      const membersTotal = Number.isFinite(scale?.members)
+        ? scale.members
+        : Number(scale?.workers) || 0;
       const workerLabel = scale
-        ? `${scale.workers}/${scale.cap} 工蜂${scale.openTasks ? ` · 待办 ${scale.openTasks}` : ''}${scale.gap > 0 ? ` · 建议再开 ${scale.gap}` : ''}`
+        ? `${scale.workers}/${scale.cap} 运行中` +
+          ` · 名额 ${scale.cap - idle}/${scale.cap}` +
+          (idle > 0 ? `（空闲 ${idle}）` : '') +
+          (scale.openTasks ? ` · 待办 ${scale.openTasks}` : '') +
+          (scale.gap > 0 ? ` · 建议再开 ${scale.gap}` : '') +
+          (scale.gap === 0 && idle > 0 && scale.target > scale.workers
+            ? ' · 需先归档空闲成员'
+            : '')
         : `${mateCount} 工蜂`;
+      const workerTitle = scale
+        ? `累计成员 ${membersTotal} 个 · 运行中 ${scale.workers} 个 · 空闲占用 ${idle} 个 · 上限 ${scale.cap} 个`
+        : `累计成员 ${mateCount} 个`;
 
       const toggle = () => {
         setOpen((v) => {
@@ -832,7 +848,7 @@ window.__ModuleLoader__.load({
         h('span', { style: s.dot(runningCount > 0 ? T.brand : T.success) }),
         h('span', { style: { ...s.title, maxWidth: 150, overflow: 'hidden', textOverflow: 'ellipsis' }, title: mission.title || '' },
           mission.title || '蜂巢任务'),
-        h('span', { style: s.meta }, `${workerLabel}${runningCount ? ` · ${runningCount} 工作中` : ''}${paused ? ' · 已暂停' : ''}`),
+        h('span', { style: s.meta, title: workerTitle }, `${workerLabel}${paused ? ' · 已暂停' : ''}`),
         open ? h('span', { style: s.bar }, h('span', { style: s.barFill(pct, T.success) })) : null,
         open ? h('span', { style: s.meta }, `${pct}%`) : null,
         open ? h('button', {

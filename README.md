@@ -29,8 +29,8 @@ Mission Control 让一个 Lead 会话把多个工蜂组织成一场「任务（M
 1. **委派守卫与人数上限（Delegation Guard & Workers Cap）**
    所有「开子会话」的入口都由 `ctx.tools.guard` 统一把关：
    - **未开启蜂巢模式时**，`subagent` / `subagent_fork` / `workflow` 一律被拒绝（`blockDelegationOutsideHive`，默认开）—— 蜂巢开关是子会话的唯一入口；
-   - **蜂巢模式下**，`subagent` / `subagent_fork` 会被要求改用 `mission_scale`（`forceMissionScaleDelegation`，默认开），否则会绕过上限、不进面板、结束时不被归档；
-   - **并发上限只数「正在运行」的成员**（`running` / `provisioning`）：`continuable` 子代理完成后不会消失，若按累计成员计数，上限会退化成总值、之后再也开不出新工蜂。`mission_scale` 返回 `workers`（运行中）与 `members`（累计）两个数。
+   - **蜂巢模式下**，`subagent` / `subagent_fork` / `workflow` 都会被要求改用 `mission_scale`（`forceMissionScaleDelegation`，默认开）。`workflow` 同样不放行：它内部会扇出任意多个 subagent，这些子会话既不登记名额、也不进面板、结束任务时更不会被归档，等于一条隐形的旁路；
+   - **名额按「累计成员」判定，并发数只用于显示**：`continuable` 子代理跑完不会消失，空闲成员仍占着名额。因此 `mission_scale` 补人时会先扣掉 `idle`（空闲成员）再算缺口，返回 `workers`（运行中）、`idle`（空闲占位）、`members`（累计成员）、`slots`（还可开几个）；两者之和超过上限就直接拒绝。满载但仍有空闲成员时，正确做法是先归档空闲成员再补人，悬浮窗也会提示「需先归档空闲成员」。
 
 2. **统一的活跃工蜂口径（Active Members）**
    队友的**唯一来源是平台的 subagent 树**：`refreshMembers()` 调 `subagents.listDescendants()` 刷新任务级缓存 `mission.members`（成员 id → 名称/label），其余同步逻辑（守卫、面板、广播、收尾）都读这份缓存；任务状态落盘时一并保存，重启后可恢复。
@@ -60,7 +60,7 @@ Mission Control 让一个 Lead 会话把多个工蜂组织成一场「任务（M
 
 7. **任务拆解与人数配平（Mission Scale）**
    `missionScale()` 从任务板实时推算配平统计：待办/进行中的子任务数、未认领数、**活跃**工蜂数、上限，以及「目标人数 = min(待认领子任务数, 上限)」与缺口 `gap`。这份统计会：
-   - 通过 `/mission-dashboard-v2.json` 的 `scale` 字段输出，悬浮窗标题栏显示 `${workers}/${cap} 工蜂 · 待办 N · 建议再开 M`；
+   - 通过 `/mission-dashboard-v2.json` 的 `scale` 字段输出，悬浮窗标题栏显示 `${workers}/${cap} 运行中 · 名额 x/cap（空闲 n）· 待办 N · 建议再开 M`；
    - 驱动提示词：Lead 侧注入「先 `mission_start` → 建任务板 → 算人数 → `mission_scale` 一次开齐 → 自己只做协调验收」的分派契约；若已收到任务但工蜂不足，则改为强制催办「现在必须再开 N 个」；子会话侧则注入「只做分配的活 + 汇报」的身份约束。
 
 8. **蜂巢模式开关与子会话管理（Hive Mode）**
@@ -184,7 +184,7 @@ Mission Control 让一个 Lead 会话把多个工蜂组织成一场「任务（M
 | `freshProvider` | `"spawn"` | 交接时创建续任者使用的 provider 参数。 |
 | `maxHandoffRounds` | `3` | 同一条交接链（按链根名统计）最多续任几代，防止阈值异常时无限 spawn。 |
 | `memberGraceMs` | `60000` | 新成员宽限期：刚创建的子会话可能暂时列不进 `listDescendants`，期间不把它从成员缓存里剪掉。 |
-| `forceMissionScaleDelegation` | `true` | 蜂巢模式下强制用 `mission_scale` 创建子会话；直接 `subagent` / `subagent_fork` 会被拒绝（否则绕过人数上限、不进面板、结束时不被归档）。`workflow` 不受此限制。 |
+| `forceMissionScaleDelegation` | `true` | 蜂巢模式下强制用 `mission_scale` 创建子会话；直接 `subagent` / `subagent_fork` / `workflow` 都会被拒绝（否则绕过人数上限、不进面板、结束时不被归档）。`workflow` 内部扇出的子会话同样无法登记，因此一并拦下。 |
 | `hiveOffNoticeTtlMs` | `604800000`（7 天） | 「蜂巢已关闭」纠偏标记的保留时长（0=永久）；标记随任务状态落盘，重启后仍会注入纠正段。 |
 | `snapshotCacheTtlMs` | `1000` | 面板快照缓存 TTL（0=关闭缓存）。并发轮询共享同一次计算（single-flight），任务状态变更会立即失效。 |
 | `measureCacheTtlMs` | `1000` | 上下文测量缓存 TTL。`tokenMeter.measure()` 是 O(surface)，短时复用避免多面板反复测量。 |
@@ -233,7 +233,7 @@ Mission Control 让一个 Lead 会话把多个工蜂组织成一场「任务（M
 
 | 方法与路径 | 用途 |
 | --- | --- |
-| `GET /mission-dashboard-v2.json` | 驾驶舱快照：任务目标、`taskSet`（是否已设真实目标）、`scale`（配平统计：workers / cap / openTasks / unownedTasks / target / gap）、人数上限、暂停状态、每个**活跃**工蜂的状态 / token / 窗口 / 占用比例 / **模型**（`model` 为策略指定值，`actualModel` 从会话事件里读到的实际使用模型）/ 工作概括，以及任务板的 pending / in_progress / completed 计数。 |
+| `GET /mission-dashboard-v2.json` | 驾驶舱快照：任务目标、`taskSet`（是否已设真实目标）、`scale`（配平统计：workers / idle / members / slots / cap / openTasks / unownedTasks / target / gap）、人数上限、暂停状态、每个**活跃**工蜂的状态 / token / 窗口 / 占用比例 / **模型**（`model` 为策略指定值，`actualModel` 从会话事件里读到的实际使用模型）/ 工作概括，以及任务板的 pending / in_progress / completed 计数。 |
 | `POST /mission-end-v1` | 结束任务：中断活跃子会话、归档、清理孤儿归档、收集结果文件、清理临时文件，并提示 Lead 汇总。请求体 `{ "sessionId": "...", "cleanup": true }`——**`sessionId` 必填**（400 `missing-sessionId`），任务不存在返回 404 `no-active-mission`。响应含 `interrupted`、`cleanup`、`resultFiles`、`closed`、`leadNotified`、`archivePruned` 等字段。 |
 | `POST /mission-mode-v1` | 蜂巢模式开关：`{ "sessionId": "...", "enabled": true, "workers": 3 }`。`enabled` 严格按布尔解析（`"false"` 字符串也视为关闭）；`workers` 钳制到 2–10；传 `workersOnly: true` 只改上限、不改启停状态。会话不存在返回 404 `session-not-found`。 |
 | `GET /mission-children-v1?sessionId=...` | 列出该会话下的所有子会话（id / 名称 / 状态 / 描述），并按普通 → 归档 → 已删除排序；每条带 `archived`（是否已归档）与 `exists`（磁盘上是否还有会话目录）。可选 `includeArchived=1`、`includeDeleted=1`。响应另含 `total`、`activeCount`、`archivedCount`、`deletedCount`。 |
@@ -277,7 +277,9 @@ mission-control/
 
 ## 注意事项
 
-- **蜂巢开关是子会话唯一入口**：默认未开启蜂巢模式时，`subagent`、`subagent_fork`、`workflow` 都会被拒绝；开启后 `subagent` / `subagent_fork` 仍会被要求改用 `mission_scale`。想让平台恢复原生并行能力，把 `blockDelegationOutsideHive` 设为 `false`；想允许蜂巢模式下直连 `subagent`，把 `forceMissionScaleDelegation` 设为 `false`。
+- **蜂巢开关是子会话唯一入口**：默认未开启蜂巢模式时，`subagent`、`subagent_fork`、`workflow` 都会被拒绝；开启后三者仍会被要求改用 `mission_scale`。想让平台恢复原生并行能力，把 `blockDelegationOutsideHive` 设为 `false`；想允许蜂巢模式下直连 `subagent`，把 `forceMissionScaleDelegation` 设为 `false`。
+- **名额按累计成员算**：`cap` 是「同时存在多少个工蜂」，不是「同时跑多少个」。空闲成员不干活但占名额，满载时先归档空闲成员再 `mission_scale`，否则缺口会一直是 0。
+- **结果文件收集有兜底边界**：优先用写类工具的实际产出；一个都没收集到时才退回「任务开始后修改过的文件」，并排除插件自身目录（源码与文档不算本次交付物）。
 - **任务状态会落盘**：状态文件在 `$DSH_HOME/storages/mission-control/missions.json`，重启后自动恢复并会对账；超过 7 天的旧任务直接丢弃。删除该文件可强制清空。
 - **清理有边界**：「结束任务」只会删除 `cleanupGlobs` 匹配的文件与 `cleanupDirs` 指定的目录，且永远跳过 `node_modules` 与 `.git`；但如果你把 `cleanupGlobs` 配得过宽，仍可能误删工作文件，请谨慎配置。
 - **归档 vs 彻底删除**：归档可逆（日志保留，可「取消归档」恢复）；「彻底删除」会一并删除会话日志目录与投影缓存，**不可恢复**，请谨慎操作。
